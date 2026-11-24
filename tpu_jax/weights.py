@@ -242,6 +242,15 @@ def _fuse_mlp_gate_up_paired_np(wgate_t: np.ndarray, wup_t: np.ndarray) -> np.nd
 # ---------------------------------------------------------------------------
 
 
+def _quantize_int8_per_channel(w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Symmetric per-output-channel INT8 weight quantization (along axis=-2)."""
+    w_f32 = w.astype(np.float32, copy=False)
+    absmax = np.max(np.abs(w_f32), axis=-2, keepdims=True)
+    scale = np.maximum(absmax / 127.0, 1e-12).astype(ml_dtypes.bfloat16)
+    w_q = np.clip(np.rint(w_f32 / scale.astype(np.float32)), -127, 127).astype(np.int8)
+    return np.ascontiguousarray(w_q), np.ascontiguousarray(np.squeeze(scale, axis=-2))
+
+
 def _build_dit_params(
     get_tensor: Callable[[str], Any],
     all_keys: set[str],
@@ -251,9 +260,14 @@ def _build_dit_params(
     put_fn: Callable[[np.ndarray, Any | None], Any],
     num_workers: int = 1,
     tp_axis: str = "tp",
+    quant: str = "none",
 ) -> dict[str, Any]:
     from jax.sharding import PartitionSpec as P
 
+    if quant not in ("none", "int8"):
+        raise ValueError(f"Unsupported quant={quant!r}; expected 'none' or 'int8'.")
+    use_int8 = quant == "int8"
+    bf16_np = np.dtype(ml_dtypes.bfloat16)
     is_diffusers = "transformer_blocks.0.attn.to_q.weight" in all_keys
     f32 = np.dtype(np.float32)
 
@@ -305,16 +319,25 @@ def _build_dit_params(
             head_dim=config.text_head_dim,
         )
         mgu = _fuse_mlp_gate_up_paired_np(mg, mu)
-        return {
+        blk_out: dict[str, Any] = {
             "prenorm": put_fn(pn, None),
             "postnorm": put_fn(pon, None),
             "qnorm": put_fn(qn, None),
             "knorm": put_fn(kn, None),
-            "qkvgate_w": put_fn(qkvg, None),
-            "wo_w": put_fn(np.ascontiguousarray(wo), None),
-            "mlp_gate_up_w": put_fn(mgu, None),
-            "mlp_down_w": put_fn(np.ascontiguousarray(md), None),
         }
+        for name, arr in (
+            ("qkvgate", qkvg),
+            ("wo", np.ascontiguousarray(wo)),
+            ("mlp_gate_up", mgu),
+            ("mlp_down", np.ascontiguousarray(md)),
+        ):
+            if use_int8:
+                wq_i8, ws_bf16 = _quantize_int8_per_channel(arr)
+                blk_out[f"{name}_w"] = put_fn(wq_i8, None)
+                blk_out[f"{name}_s"] = put_fn(ws_bf16, None)
+            else:
+                blk_out[f"{name}_w"] = put_fn(arr, None)
+        return blk_out
 
     # TextFusion blocks (2 layerwise + 2 refiner)
     tf_prefix = "text_fusion" if is_diffusers else "txtfusion"
@@ -358,9 +381,26 @@ def _build_dit_params(
         del buf
         return res
 
-    def _stream_2d_linear(suffix_diff: str, suffix_nat: str, shape_2d: tuple[int, int], spec: Any):
-        buf = np.empty((n_layers, shape_2d[0], shape_2d[1]), dtype=np_dtype)
+    def _stream_2d_linear(
+        suffix_diff: str, suffix_nat: str, shape_2d: tuple[int, int], spec: Any, scale_spec: Any
+    ):
         suf = suffix_diff if is_diffusers else suffix_nat
+        if use_int8:
+            buf_q = np.empty((n_layers, shape_2d[0], shape_2d[1]), dtype=np.int8)
+            buf_s = np.empty((n_layers, shape_2d[1]), dtype=bf16_np)
+
+            def _fill_q(i: int):
+                wq_i8, ws = _quantize_int8_per_channel(_w_np(f"{blk_prefix}.{i}.{suf}", transpose=True))
+                buf_q[i] = wq_i8
+                buf_s[i] = ws
+
+            _run_parallel(_fill_q)
+            res_w = put_fn(buf_q, spec)
+            res_s = put_fn(buf_s, scale_spec)
+            del buf_q, buf_s
+            return res_w, res_s
+
+        buf = np.empty((n_layers, shape_2d[0], shape_2d[1]), dtype=np_dtype)
 
         def _fill(i: int):
             buf[i] = _w_np(f"{blk_prefix}.{i}.{suf}", transpose=True)
@@ -368,7 +408,7 @@ def _build_dit_params(
         _run_parallel(_fill)
         res = put_fn(buf, spec)
         del buf
-        return res
+        return res, None
 
     def _stream_mod_lin():
         buf = np.empty((n_layers, 6 * dim), dtype=np_dtype)
@@ -383,9 +423,7 @@ def _build_dit_params(
         return res
 
     def _stream_qkvgate():
-        buf = np.empty((n_layers, dim, qkvg_out), dtype=np_dtype)
-
-        def _fill(i: int):
+        def _load_layer_fused(i: int, dst: np.ndarray) -> None:
             p = f"{blk_prefix}.{i}"
             if is_diffusers:
                 wq = _w_np(f"{p}.attn.to_q.weight", transpose=True)
@@ -398,18 +436,34 @@ def _build_dit_params(
                 wv = _w_np(f"{p}.attn.wv.weight", transpose=True)
                 wg = _w_np(f"{p}.attn.gate.weight", transpose=True)
             _fuse_qkvgate_kv_grouped_into(
-                buf[i], wq, wk, wv, wg, num_heads=config.heads, num_kv_heads=kv_heads, head_dim=hd
+                dst, wq, wk, wv, wg, num_heads=config.heads, num_kv_heads=kv_heads, head_dim=hd
             )
 
-        _run_parallel(_fill)
+        if use_int8:
+            buf_q = np.empty((n_layers, dim, qkvg_out), dtype=np.int8)
+            buf_s = np.empty((n_layers, qkvg_out), dtype=bf16_np)
+
+            def _fill_q(i: int):
+                tmp = np.empty((dim, qkvg_out), dtype=np_dtype)
+                _load_layer_fused(i, tmp)
+                wq_i8, ws = _quantize_int8_per_channel(tmp)
+                buf_q[i] = wq_i8
+                buf_s[i] = ws
+
+            _run_parallel(_fill_q)
+            res_w = put_fn(buf_q, P(None, None, tp_axis))
+            res_s = put_fn(buf_s, P(None, tp_axis))
+            del buf_q, buf_s
+            return res_w, res_s
+
+        buf = np.empty((n_layers, dim, qkvg_out), dtype=np_dtype)
+        _run_parallel(lambda i: _load_layer_fused(i, buf[i]))
         res = put_fn(buf, P(None, None, tp_axis))
         del buf
-        return res
+        return res, None
 
     def _stream_mlp_gate_up():
-        buf = np.empty((n_layers, dim, 2 * mlp_dim), dtype=np_dtype)
-
-        def _fill(i: int):
+        def _load_layer_fused(i: int, dst: np.ndarray) -> None:
             p = f"{blk_prefix}.{i}"
             if is_diffusers:
                 mg = _w_np(f"{p}.ff.gate.weight", transpose=True)
@@ -417,27 +471,56 @@ def _build_dit_params(
             else:
                 mg = _w_np(f"{p}.mlp.gate.weight", transpose=True)
                 mu = _w_np(f"{p}.mlp.up.weight", transpose=True)
-            _fuse_mlp_gate_up_paired_into(buf[i], mg, mu)
+            _fuse_mlp_gate_up_paired_into(dst, mg, mu)
 
-        _run_parallel(_fill)
+        if use_int8:
+            buf_q = np.empty((n_layers, dim, 2 * mlp_dim), dtype=np.int8)
+            buf_s = np.empty((n_layers, 2 * mlp_dim), dtype=bf16_np)
+
+            def _fill_q(i: int):
+                tmp = np.empty((dim, 2 * mlp_dim), dtype=np_dtype)
+                _load_layer_fused(i, tmp)
+                wq_i8, ws = _quantize_int8_per_channel(tmp)
+                buf_q[i] = wq_i8
+                buf_s[i] = ws
+
+            _run_parallel(_fill_q)
+            res_w = put_fn(buf_q, P(None, None, tp_axis))
+            res_s = put_fn(buf_s, P(None, tp_axis))
+            del buf_q, buf_s
+            return res_w, res_s
+
+        buf = np.empty((n_layers, dim, 2 * mlp_dim), dtype=np_dtype)
+        _run_parallel(lambda i: _load_layer_fused(i, buf[i]))
         res = put_fn(buf, P(None, None, tp_axis))
         del buf
-        return res
+        return res, None
 
     # Order large fields so async H2D DMA overlaps cleanly with CPU thread-pool assembly!
+    qkvgate_w, qkvgate_s = _stream_qkvgate()
+    wo_w, wo_s = _stream_2d_linear(
+        "attn.to_out.0.weight", "attn.wo.weight", (dim, dim), P(None, tp_axis, None), P()
+    )
+    mlp_gate_up_w, mlp_gate_up_s = _stream_mlp_gate_up()
+    mlp_down_w, mlp_down_s = _stream_2d_linear(
+        "ff.down.weight", "mlp.down.weight", (mlp_dim, dim), P(None, tp_axis, None), P()
+    )
     blocks = {
         "prenorm": _stream_1d_norm("norm1.weight", "prenorm.scale", dim),
         "postnorm": _stream_1d_norm("norm2.weight", "postnorm.scale", dim),
         "qnorm": _stream_1d_norm("attn.norm_q.weight", "attn.qknorm.qnorm.scale", hd),
         "knorm": _stream_1d_norm("attn.norm_k.weight", "attn.qknorm.knorm.scale", hd),
         "mod_lin": _stream_mod_lin(),
-        "qkvgate_w": _stream_qkvgate(),
-        "wo_w": _stream_2d_linear("attn.to_out.0.weight", "attn.wo.weight", (dim, dim), P(None, tp_axis, None)),
-        "mlp_gate_up_w": _stream_mlp_gate_up(),
-        "mlp_down_w": _stream_2d_linear(
-            "ff.down.weight", "mlp.down.weight", (mlp_dim, dim), P(None, tp_axis, None)
-        ),
+        "qkvgate_w": qkvgate_w,
+        "wo_w": wo_w,
+        "mlp_gate_up_w": mlp_gate_up_w,
+        "mlp_down_w": mlp_down_w,
     }
+    if use_int8:
+        blocks["qkvgate_s"] = qkvgate_s
+        blocks["wo_s"] = wo_s
+        blocks["mlp_gate_up_s"] = mlp_gate_up_s
+        blocks["mlp_down_s"] = mlp_down_s
 
     # Precomputed FP32 sinusoidal time frequencies and 3D axial RoPE omegas.
     half = config.tdim // 2
@@ -523,6 +606,7 @@ def build_dit_params_from_state_dict(
     device: Any | None = None,
     mesh: Any | None = None,
     num_workers: int = 1,
+    quant: str = "none",
 ) -> dict[str, Any]:
     """Convert an in-memory PyTorch/NumPy state dict into scan-ready JAX DiT params."""
     np_dtype = _resolve_np_dtype(dtype)
@@ -533,7 +617,13 @@ def build_dit_params_from_state_dict(
         return state_dict.pop(k) if consume else state_dict[k]
 
     return _build_dit_params(
-        _get, all_keys, config, np_dtype=np_dtype, put_fn=put_fn, num_workers=1 if consume else num_workers
+        _get,
+        all_keys,
+        config,
+        np_dtype=np_dtype,
+        put_fn=put_fn,
+        num_workers=1 if consume else num_workers,
+        quant=quant,
     )
 
 
@@ -572,6 +662,8 @@ def shard_dit_params(params: dict[str, Any], mesh: Any, tp_axis: str = "tp") -> 
             for bk, bv in v.items():
                 if bk in ("qkvgate_w", "mlp_gate_up_w"):
                     spec = P(None, None, tp_axis)
+                elif bk in ("qkvgate_s", "mlp_gate_up_s"):
+                    spec = P(None, tp_axis)
                 elif bk in ("wo_w", "mlp_down_w"):
                     spec = P(None, tp_axis, None)
                 else:
@@ -591,6 +683,7 @@ def load_dit_weights(
     device: Any | None = None,
     mesh: Any | None = None,
     num_workers: int | None = None,
+    quant: str = "none",
 ) -> tuple[Krea2DiTConfig, dict[str, Any]]:
     """Parallel-stream Krea 2 DiT safetensors directly into TPU HBM (zero PyTorch)."""
     files, cfg_path = _resolve_dit_files(model_path)
@@ -610,6 +703,7 @@ def load_dit_weights(
             np_dtype=np_dtype,
             put_fn=put_fn,
             num_workers=workers,
+            quant=quant,
         )
     finally:
         reader.close()

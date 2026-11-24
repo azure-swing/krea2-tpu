@@ -52,13 +52,17 @@ def _rms_norm(x: jnp.ndarray, weight: jnp.ndarray, eps: float = 1e-5) -> jnp.nda
     return (x_f32 * inv_rms * weight.astype(jnp.float32)).astype(x.dtype)
 
 
-def _matmul(x: jnp.ndarray, w: jnp.ndarray) -> jnp.ndarray:
-    return lax.dot_general(
+def _matmul(x: jnp.ndarray, w: jnp.ndarray, scale: jnp.ndarray | None = None) -> jnp.ndarray:
+    w_eff = w.astype(x.dtype) if w.dtype != x.dtype else w
+    out = lax.dot_general(
         x,
-        w,
+        w_eff,
         (((x.ndim - 1,), (0,)), ((), ())),
         preferred_element_type=jnp.float32,
-    ).astype(x.dtype)
+    )
+    if scale is not None:
+        out = out * scale.astype(jnp.float32)
+    return out.astype(x.dtype)
 
 
 def precompute_rope_omegas(
@@ -326,7 +330,9 @@ def _attention_block_op(
     q_g = group_size * head_dim
     per_kv = 2 * q_g + 2 * head_dim
 
-    qkvg = _matmul(y, block["qkvgate_w"]).reshape(batch, seq_len, num_kv_heads, per_kv)
+    qkvg = _matmul(y, block["qkvgate_w"], block.get("qkvgate_s")).reshape(
+        batch, seq_len, num_kv_heads, per_kv
+    )
     q = qkvg[..., :q_g].reshape(batch, seq_len, num_heads, head_dim)
     k = qkvg[..., q_g : q_g + head_dim]
     v = qkvg[..., q_g + head_dim : q_g + 2 * head_dim]
@@ -347,16 +353,16 @@ def _attention_block_op(
         splash_block_size=splash_block_size,
     )
     gated = attn_out * jax.nn.sigmoid(gate)
-    return _matmul(gated, block["wo_w"])
+    return _matmul(gated, block["wo_w"], block.get("wo_s"))
 
 
 def _swiglu_op(y: jnp.ndarray, block: dict[str, jnp.ndarray]) -> jnp.ndarray:
     """Fused Gate+Up SwiGLU MLP (``mlp_gate_up_w`` shape ``[dim, 2 * mlp_dim]`` paired by col)."""
-    gu = _matmul(y, block["mlp_gate_up_w"])
+    gu = _matmul(y, block["mlp_gate_up_w"], block.get("mlp_gate_up_s"))
     gu_paired = gu.reshape(*y.shape[:-1], -1, 2)
     gate = gu_paired[..., 0]
     up = gu_paired[..., 1]
-    return _matmul(jax.nn.silu(gate) * up, block["mlp_down_w"])
+    return _matmul(jax.nn.silu(gate) * up, block["mlp_down_w"], block.get("mlp_down_s"))
 
 
 def _text_fusion_block_forward(
@@ -406,7 +412,7 @@ def _single_stream_block_forward(
     splash_block_size: int,
 ) -> jnp.ndarray:
     """Single Krea 2 ``SingleStreamBlock`` forward (``jax.lax.scan`` body)."""
-    w_dtype = block["qkvgate_w"].dtype
+    w_dtype = block["mod_lin"].dtype
     mod_out = tvec + block["mod_lin"][None, None, :]
     prescale, preshift, pregate, postscale, postshift, postgate = jnp.split(mod_out, 6, axis=-1)
 

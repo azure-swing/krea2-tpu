@@ -21,6 +21,8 @@ Pure JAX/XLA end-to-end inference stack for **Krea 2 (Turbo & Raw)** on Google C
 
 ## Quick Start on TPU
 
+The JAX runner defaults to `krea/Krea-2-Turbo` with 8 steps, CFG 0, and fixed `mu=1.15`. Use `--model` to select a local snapshot or `--hf-repo` to select another repository.
+
 ```bash
 bash tpu_jax/setup_tpu.sh
 
@@ -30,7 +32,6 @@ python3 tpu_jax/run_jax.py --mode probe
 # 2. End-to-end Turbo 1024x1024 (8 steps, BF16, SplashAttention)
 export HF_TOKEN=hf_...
 python3 tpu_jax/run_jax.py --mode generate \
-  --hf-repo krea/Krea-2-Turbo \
   --download-dir /dev/shm/krea-2-turbo \
   --prompt "A red fox sitting in fresh snow, golden hour, photorealistic" \
   --width 1024 --height 1024 --steps 8 --cfg 0.0 --mu 1.15 \

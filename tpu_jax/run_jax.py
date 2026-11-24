@@ -396,6 +396,7 @@ def run_generate(args) -> dict[str, Any]:
         device=None if mesh is not None else dev0,
         mesh=mesh,
         num_workers=args.load_workers,
+        quant=args.quant,
     )
     jax.block_until_ready(dit_params)
     dit_load_sec = time.perf_counter() - t_load0
@@ -626,6 +627,7 @@ def run_bench(args) -> dict[str, Any]:
         device=None if mesh is not None else dev0,
         mesh=mesh,
         num_workers=args.load_workers,
+        quant=args.quant,
     )
     jax.block_until_ready(dit_params)
     load_sec = time.perf_counter() - t_load0
@@ -768,6 +770,7 @@ def run_parity(args) -> dict[str, Any]:
         device=None if mesh is not None else dev0,
         mesh=mesh,
         num_workers=args.load_workers,
+        quant=args.quant,
     )
     jax.block_until_ready(dit_params)
     load_sec = time.perf_counter() - t0
@@ -851,7 +854,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mode", choices=("probe", "generate", "bench", "parity"), default="probe")
     p.add_argument("--model", type=str, default=None, help="Local model snapshot directory")
     p.add_argument("--dit-path", type=str, default=None, help="Optional explicit turbo.safetensors / transformer/ path")
-    p.add_argument("--hf-repo", type=str, default=None, help="HuggingFace repo id (e.g. krea/Krea-2-Turbo)")
+    p.add_argument(
+        "--hf-repo", default="krea/Krea-2-Turbo", help="Hugging Face repo ID (default: %(default)s)"
+    )
     p.add_argument("--download-dir", type=str, default=None, help="Fallback disk dir when RAM tmpfs is unavailable")
     p.add_argument("--disk-cache", action="store_true", help="Disable RAM tmpfs cache and download to disk")
     p.add_argument("--local-files-only", action="store_true", help="Offline mode (reuse cached snapshot only)")
@@ -874,6 +879,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-images", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--dtype", choices=("bf16", "bfloat16", "fp32", "float32"), default="bf16")
+    p.add_argument("--quant", choices=("none", "int8"), default="none", help="Weight-only quantization for DiT")
     p.add_argument("--vae-dtype", choices=("bf16", "bfloat16", "fp32", "float32"), default="bf16")
     p.add_argument("--resident-vae", choices=("auto", "on", "off"), default="auto")
     p.add_argument("--vae-attn-chunk", type=int, default=1024)
