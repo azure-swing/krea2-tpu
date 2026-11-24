@@ -8,7 +8,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 "${PYTHON_BIN}" -m pip install --upgrade pip
 "${PYTHON_BIN}" -m pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-"${PYTHON_BIN}" -m pip install -U safetensors tokenizers pillow numpy huggingface_hub hf_transfer
+"${PYTHON_BIN}" -m pip install -U safetensors tokenizers pillow numpy huggingface_hub hf_transfer filelock
 
 cat <<'EOF'
 Krea 2 Native JAX TPU environment setup complete.

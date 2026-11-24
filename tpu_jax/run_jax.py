@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Native JAX/XLA TPU inference runner & benchmark suite for Krea 2 (Turbo / Raw).
 
-Zero PyTorch runtime dependency. Orchestrates all three stages natively in JAX
-with strict HBM lifecycle management so 12B BF16 Krea 2 fits cleanly on single
-TPU v6e-1 (32 GiB HBM) and scales to multi-chip TPU meshes via 1D TP:
-
-  Stage 1: Qwen3-VL-4B text tower (~7.5 GB BF16) -> free HBM
-  Stage 2: SingleStreamDiT 12B (~25.0 GB BF16)   -> free HBM
-  Stage 3: Qwen-Image VAE decoder (~0.13 GB BF16) -> PNG
+Zero PyTorch runtime dependency. Incorporates MOSS-Image-TPU's model loading &
+stage-switching optimizations:
+- RAM-backed ``tmpfs`` downloads by default on Linux TPU (auto-mounts up to
+  64 GiB tmpfs on Colab, skipping duplicate 26 GB diffusers shards -> ~35.7 GiB).
+- Parallel pre-allocated NumPy/bfloat16 safetensors reads pipelined with async
+  field-by-field H2D ``jax.device_put`` (halving peak Host RAM & overlapping CPU
+  transpose/fuse with TPU DMA).
+- Explicit ``Array.delete()`` via ``release_tpu_pytree()`` for deterministic,
+  zero-GC-lag HBM reclamation during Stage 1 -> Stage 2 -> Stage 3 transitions.
+- Resident VAE (~125 MB BF16) auto-enabled on >= 20 GiB HBM (e.g. TPU v6e-1).
+- Multi-prompt batching across stages so Stage 1 / Stage 2 each load only ONCE.
 """
 
 from __future__ import annotations
@@ -60,6 +64,16 @@ def _memory_stats_gib(device) -> dict[str, float | None]:
     }
 
 
+def _should_keep_vae_resident(mode: str, device: Any) -> bool:
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    # Auto: gate resident VAE (~125 MB BF16) on >= 20 GiB HBM (matching MOSS-Image-TPU).
+    limit = _memory_stats_gib(device).get("bytes_limit_gib")
+    return bool(limit is not None and limit >= 20.0)
+
+
 def _configure_jax(args) -> tuple[Any, Any | None, list[Any]]:
     import jax
     from jax.sharding import Mesh
@@ -80,57 +94,39 @@ def _configure_jax(args) -> tuple[Any, Any | None, list[Any]]:
     return dev0, mesh, devices[:tp]
 
 
-def download_krea2_snapshot(
-    repo_id: str,
-    local_dir: str | Path,
+def _resolve_model_root(
+    args,
     *,
-    token: str | None = None,
-    checkpoint_file: str = "turbo.safetensors",
-) -> Path:
-    """Download ONLY the minimal files needed for native JAX inference (~35.7 GB vs ~62 GB).
+    components: tuple[str, ...] = ("dit", "text_encoder", "tokenizer", "vae"),
+) -> tuple[Path, dict[str, Any]]:
+    from tpu_jax.model_cache import host_memory_stats_gib, resolve_model_bundle
 
-    Skips duplicate diffusers ``transformer/`` shards when downloading single-file
-    ``turbo.safetensors`` / ``raw.safetensors``.
-    """
-    from huggingface_hub import snapshot_download
-
-    allow_patterns = [
-        "model_index.json",
-        "scheduler/scheduler_config.json",
-        checkpoint_file,
-        "text_encoder/config.json",
-        "text_encoder/model.safetensors",
-        "text_encoder/model.safetensors.index.json",
-        "text_encoder/model-*.safetensors",
-        "tokenizer/tokenizer.json",
-        "tokenizer/tokenizer_config.json",
-        "vae/config.json",
-        "vae/diffusion_pytorch_model.safetensors",
-    ]
-    out = snapshot_download(
-        repo_id=repo_id,
-        local_dir=str(local_dir),
-        allow_patterns=allow_patterns,
-        token=token or os.environ.get("HF_TOKEN"),
-    )
-    return Path(out)
-
-
-def _resolve_model_root(args) -> Path:
+    t0 = time.perf_counter()
     if args.model:
-        return Path(args.model)
-    if args.hf_repo:
-        target = Path(args.download_dir or "/dev/shm/krea-2-turbo")
-        ckpt = "raw.safetensors" if "raw" in args.hf_repo.lower() else "turbo.safetensors"
+        root, backend = Path(args.model), "local"
+    elif args.hf_repo:
         token = args.hf_token
         if not token and args.hf_token_file:
             token = Path(args.hf_token_file).read_text(encoding="utf-8").strip()
-        print(f"[download] Fetching minimal JAX files from {args.hf_repo} -> {target}", flush=True)
-        t0 = time.perf_counter()
-        root = download_krea2_snapshot(args.hf_repo, target, token=token, checkpoint_file=ckpt)
-        print(f"[download] Done in {time.perf_counter() - t0:.1f}s", flush=True)
-        return root
-    raise ValueError("Provide either --model <local_dir> or --hf-repo <repo_id>.")
+        root, backend = resolve_model_bundle(
+            args.hf_repo,
+            components=components,
+            token=token,
+            local_files_only=args.local_files_only,
+            disk_cache_dir=args.download_dir,
+            prefer_ram=not args.disk_cache,
+        )
+    else:
+        raise ValueError("Provide either --model <local_dir> or --hf-repo <repo_id>.")
+
+    info = {
+        "model_root": str(root),
+        "cache_backend": backend,
+        "resolve_seconds": round(time.perf_counter() - t0, 3),
+        "host_mem_after_resolve": host_memory_stats_gib(),
+    }
+    print(f"[model_cache] {json.dumps(info)}", flush=True)
+    return root, info
 
 
 def _make_init_latents(
@@ -155,7 +151,6 @@ def _make_init_latents(
         if tuple(arr.shape) != shape:
             raise ValueError(f"init_latents shape {arr.shape} != expected {shape}")
         return arr
-    # Per-image deterministic normal noise (matching seed + i convention)
     slices = []
     for i in range(batch):
         rng = np.random.default_rng(seed + i)
@@ -163,7 +158,7 @@ def _make_init_latents(
     return np.concatenate(slices, axis=0)
 
 
-def _save_images(pixels_nhwc: np.ndarray, output_prefix: str | Path) -> list[str]:
+def _save_images(pixels_nhwc: np.ndarray, output_prefix: str | Path, *, start_idx: int = 0) -> list[str]:
     from PIL import Image
 
     arr = np.clip(pixels_nhwc, -1.0, 1.0) * 0.5 + 0.5
@@ -171,7 +166,12 @@ def _save_images(pixels_nhwc: np.ndarray, output_prefix: str | Path) -> list[str
     saved = []
     prefix = str(output_prefix)
     for i in range(u8.shape[0]):
-        out_path = f"{prefix}_{i}.png" if u8.shape[0] > 1 or not prefix.endswith(".png") else prefix
+        idx = start_idx + i
+        if u8.shape[0] == 1 and start_idx == 0 and prefix.endswith(".png"):
+            out_path = prefix
+        else:
+            stem = prefix[:-4] if prefix.endswith(".png") else prefix
+            out_path = f"{stem}_{idx}.png"
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(u8[i]).save(out_path)
         saved.append(out_path)
@@ -180,71 +180,95 @@ def _save_images(pixels_nhwc: np.ndarray, output_prefix: str | Path) -> list[str
 
 def _encode_prompts_stage1(
     model_root: Path,
-    prompts: list[str],
-    negative_prompts: list[str] | None,
+    prompt_groups: list[list[str]],
+    negative_prompt_groups: list[list[str]] | None,
     *,
     dtype: str,
     device: Any,
+    num_workers: int | None = None,
     text_attn_impl: str = "xla",
-) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+) -> tuple[list[dict[str, np.ndarray]], dict[str, Any]]:
     import jax
     import jax.numpy as jnp
 
+    from tpu_jax.model_cache import host_memory_stats_gib
     from tpu_jax.text_encoder import Krea2Tokenizer, make_text_encode_fn
-    from tpu_jax.weights import load_qwen3_text_weights
+    from tpu_jax.weights import load_qwen3_text_weights, release_tpu_pytree
+
+    host_before = host_memory_stats_gib()
+    hbm_before = _memory_stats_gib(device)
 
     t0 = time.perf_counter()
-    te_cfg, te_params = load_qwen3_text_weights(model_root, dtype=dtype, device=device)
+    te_cfg, te_params = load_qwen3_text_weights(
+        model_root, dtype=dtype, device=device, num_workers=num_workers
+    )
     jax.block_until_ready(te_params)
     load_sec = time.perf_counter() - t0
 
     tokenizer = Krea2Tokenizer(model_root, config=te_cfg)
     encode_fn = make_text_encode_fn(te_cfg, attn_impl=text_attn_impl)
 
-    pos_ids, pos_mask = tokenizer.tokenize(prompts)
-    t1 = time.perf_counter()
-    pos_h, pos_m = encode_fn(
-        te_params,
-        jax.device_put(jnp.asarray(pos_ids, dtype=jnp.int32), device),
-        jax.device_put(jnp.asarray(pos_mask, dtype=jnp.bool_), device),
-    )
-    pos_h.block_until_ready()
-    encode_pos_sec = time.perf_counter() - t1
-
-    result: dict[str, np.ndarray] = {
-        "pos_context": np.asarray(pos_h, dtype=np.float32),
-        "pos_txtmask": np.asarray(pos_m, dtype=np.bool_),
-    }
-    encode_neg_sec = 0.0
-    if negative_prompts is not None:
-        neg_ids, neg_mask = tokenizer.tokenize(negative_prompts)
-        t2 = time.perf_counter()
-        neg_h, neg_m = encode_fn(
+    results: list[dict[str, np.ndarray]] = []
+    encode_pos_times = []
+    encode_neg_times = []
+    for idx, prompts in enumerate(prompt_groups):
+        pos_ids, pos_mask = tokenizer.tokenize(prompts)
+        t1 = time.perf_counter()
+        pos_h, pos_m = encode_fn(
             te_params,
-            jax.device_put(jnp.asarray(neg_ids, dtype=jnp.int32), device),
-            jax.device_put(jnp.asarray(neg_mask, dtype=jnp.bool_), device),
+            jax.device_put(jnp.asarray(pos_ids, dtype=jnp.int32), device),
+            jax.device_put(jnp.asarray(pos_mask, dtype=jnp.bool_), device),
         )
-        neg_h.block_until_ready()
-        encode_neg_sec = time.perf_counter() - t2
-        result["neg_context"] = np.asarray(neg_h, dtype=np.float32)
-        result["neg_txtmask"] = np.asarray(neg_m, dtype=np.bool_)
+        pos_h.block_until_ready()
+        encode_pos_times.append(round(time.perf_counter() - t1, 4))
+        entry: dict[str, np.ndarray] = {
+            "pos_context": np.asarray(pos_h, dtype=np.float32),
+            "pos_txtmask": np.asarray(pos_m, dtype=np.bool_),
+        }
+        release_tpu_pytree((pos_h, pos_m))
 
-    mem = _memory_stats_gib(device)
-    del te_params, pos_h, pos_m
+        if negative_prompt_groups is not None:
+            neg_ids, neg_mask = tokenizer.tokenize(negative_prompt_groups[idx])
+            t2 = time.perf_counter()
+            neg_h, neg_m = encode_fn(
+                te_params,
+                jax.device_put(jnp.asarray(neg_ids, dtype=jnp.int32), device),
+                jax.device_put(jnp.asarray(neg_mask, dtype=jnp.bool_), device),
+            )
+            neg_h.block_until_ready()
+            encode_neg_times.append(round(time.perf_counter() - t2, 4))
+            entry["neg_context"] = np.asarray(neg_h, dtype=np.float32)
+            entry["neg_txtmask"] = np.asarray(neg_m, dtype=np.bool_)
+            release_tpu_pytree((neg_h, neg_m))
+        results.append(entry)
+
+    hbm_peak = _memory_stats_gib(device)
+    drop_sec, freed_leaves = release_tpu_pytree(te_params)
+    del te_params
     gc.collect()
+    hbm_after_drop = _memory_stats_gib(device)
+    host_after = host_memory_stats_gib()
 
     metrics = {
-        "load_seconds": round(load_sec, 3),
-        "encode_pos_seconds": round(encode_pos_sec, 3),
-        "encode_neg_seconds": round(encode_neg_sec, 3),
-        "memory_stats_peak": mem,
+        "load_and_h2d_seconds": round(load_sec, 3),
+        "encode_pos_seconds": encode_pos_times,
+        "encode_neg_seconds": encode_neg_times,
+        "drop_tpu_seconds": round(drop_sec, 4),
+        "freed_leaves": freed_leaves,
+        "hbm_before": hbm_before,
+        "hbm_peak": hbm_peak,
+        "hbm_after_drop": hbm_after_drop,
+        "host_mem_before": host_before,
+        "host_mem_after": host_after,
     }
-    return result, metrics
+    return results, metrics
 
 
 def run_probe(args) -> dict[str, Any]:
     import jax
     import jax.numpy as jnp
+
+    from tpu_jax.model_cache import host_memory_stats_gib
 
     dev0, _mesh, active_devs = _configure_jax(args)
     device_kind = getattr(dev0, "device_kind", str(dev0))
@@ -256,7 +280,9 @@ def run_probe(args) -> dict[str, Any]:
         "device_kind": device_kind,
         "peak_bf16_tflops_est": _tpu_peak_bf16_tflops(device_kind, len(active_devs)),
         "platform": dev0.platform,
+        "host_memory": host_memory_stats_gib(),
         "memory_stats_before": _memory_stats_gib(dev0),
+        "resident_vae_auto": _should_keep_vae_resident("auto", dev0),
     }
 
     a = jnp.ones((1024, 1024), dtype=jnp.bfloat16)
@@ -293,39 +319,75 @@ def run_generate(args) -> dict[str, Any]:
     import jax.numpy as jnp
 
     from tpu_jax.dit import make_denoise_fn
+    from tpu_jax.model_cache import host_memory_stats_gib
     from tpu_jax.scheduler import compute_timesteps, estimate_step_tflops
     from tpu_jax.vae import make_vae_decode_fn
-    from tpu_jax.weights import load_dit_weights, load_vae_decoder_weights
+    from tpu_jax.weights import (
+        load_dit_weights,
+        load_vae_decoder_weights,
+        release_tpu_pytree,
+    )
 
     dev0, mesh, active_devs = _configure_jax(args)
     device_kind = getattr(dev0, "device_kind", str(dev0))
     peak_tflops = _tpu_peak_bf16_tflops(device_kind, len(active_devs))
-    model_root = _resolve_model_root(args)
 
-    prompts = [args.prompt] * args.num_images
+    # Build prompt list (supports --prompts-file for multi-prompt single-load execution!)
+    if args.prompts_file:
+        prompt_list = [
+            line.strip()
+            for line in Path(args.prompts_file).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    else:
+        prompt_list = [args.prompt]
+
+    components: tuple[str, ...] = (
+        ("dit", "vae") if args.prompt_embeds else ("dit", "text_encoder", "tokenizer", "vae")
+    )
+    model_root, cache_info = _resolve_model_root(args, components=components)
     do_cfg = args.cfg > 0.0
-    neg_prompts = [args.negative_prompt] * args.num_images if do_cfg else None
 
-    # --- Stage 1: Text Encoding (or load cached embeds) ---
+    # --- Optional Resident VAE (~125 MB BF16 on >= 20 GiB HBM) ---
+    resident_vae = _should_keep_vae_resident(args.resident_vae, dev0)
+    vae_cfg = None
+    vae_params = None
+    vae_load_sec = 0.0
+    if resident_vae:
+        t_v0 = time.perf_counter()
+        vae_cfg, vae_params = load_vae_decoder_weights(model_root, dtype=args.vae_dtype, device=dev0)
+        jax.block_until_ready(vae_params)
+        vae_load_sec = time.perf_counter() - t_v0
+        print(
+            f"[vae:resident] loaded in {vae_load_sec:.3f}s, hbm={_memory_stats_gib(dev0)}",
+            flush=True,
+        )
+
+    # --- Stage 1: Encode ALL prompts once, then deterministically free Text Encoder HBM ---
     if args.prompt_embeds:
         data = np.load(args.prompt_embeds, allow_pickle=False)
-        embeds = {k: data[k] for k in data.files}
+        embeds_list = [{k: data[k] for k in data.files}]
         stage1_metrics: dict[str, Any] = {"loaded_from_cache": str(args.prompt_embeds)}
     else:
-        embeds, stage1_metrics = _encode_prompts_stage1(
+        prompt_groups = [[p] * args.num_images for p in prompt_list]
+        neg_groups = [[args.negative_prompt] * args.num_images for _ in prompt_list] if do_cfg else None
+        embeds_list, stage1_metrics = _encode_prompts_stage1(
             model_root,
-            prompts,
-            neg_prompts,
+            prompt_groups,
+            neg_groups,
             dtype=args.dtype,
             device=dev0,
+            num_workers=args.load_workers,
             text_attn_impl="xla" if dev0.platform == "tpu" else "einsum",
         )
         if args.save_embeds:
             Path(args.save_embeds).parent.mkdir(parents=True, exist_ok=True)
-            np.savez(args.save_embeds, **embeds)
+            np.savez(args.save_embeds, **embeds_list[0])
     print(f"[stage1:text_encoder] {json.dumps(stage1_metrics)}", flush=True)
 
-    # --- Stage 2: DiT Denoising ---
+    # --- Stage 2: Parallel-stream DiT once & denoise ALL prompts ---
+    dit_host_before = host_memory_stats_gib()
+    dit_hbm_before = _memory_stats_gib(dev0)
     t_load0 = time.perf_counter()
     dit_path = Path(args.dit_path) if args.dit_path else model_root
     dit_cfg, dit_params = load_dit_weights(
@@ -333,6 +395,7 @@ def run_generate(args) -> dict[str, Any]:
         dtype=args.dtype,
         device=None if mesh is not None else dev0,
         mesh=mesh,
+        num_workers=args.load_workers,
     )
     jax.block_until_ready(dit_params)
     dit_load_sec = time.perf_counter() - t_load0
@@ -345,27 +408,9 @@ def run_generate(args) -> dict[str, Any]:
         y2=args.y2,
         mu=args.mu,
     )
-    init_lat_np = _make_init_latents(
-        batch=args.num_images,
-        width=args.width,
-        height=args.height,
-        channels=dit_cfg.channels,
-        patch=dit_cfg.patch,
-        seed=args.seed,
-        init_latents_path=args.init_latents,
-    )
-
-    jnp_dtype = jnp.bfloat16 if args.dtype in ("bf16", "bfloat16") else jnp.float32
-    pos_ctx = jnp.asarray(embeds["pos_context"], dtype=jnp_dtype)
-    pos_mask = jnp.asarray(embeds["pos_txtmask"], dtype=jnp.bool_)
-    neg_ctx = jnp.asarray(embeds["neg_context"], dtype=jnp_dtype) if do_cfg else None
-    neg_mask = jnp.asarray(embeds["neg_txtmask"], dtype=jnp.bool_) if do_cfg else None
     ts_j = jnp.asarray(ts_np, dtype=jnp.float32)
-
     if mesh is None:
-        pos_ctx, pos_mask, ts_j = jax.device_put((pos_ctx, pos_mask, ts_j), dev0)
-        if do_cfg:
-            neg_ctx, neg_mask = jax.device_put((neg_ctx, neg_mask), dev0)
+        ts_j = jax.device_put(ts_j, dev0)
 
     attn_impl = args.attn_impl
     if attn_impl == "auto":
@@ -382,32 +427,61 @@ def run_generate(args) -> dict[str, Any]:
         donate_latents=True,
     )
 
-    run_times = []
-    final_latents_np = None
-    for run_idx in range(args.runs):
-        lat_in = jnp.asarray(init_lat_np, dtype=jnp.float32)
+    jnp_dtype = jnp.bfloat16 if args.dtype in ("bf16", "bfloat16") else jnp.float32
+    all_run_times: list[float] = []
+    final_latents_list: list[np.ndarray] = []
+
+    for p_idx, embeds in enumerate(embeds_list):
+        init_lat_np = _make_init_latents(
+            batch=args.num_images,
+            width=args.width,
+            height=args.height,
+            channels=dit_cfg.channels,
+            patch=dit_cfg.patch,
+            seed=args.seed + p_idx * args.num_images,
+            init_latents_path=args.init_latents if p_idx == 0 else None,
+        )
+        pos_ctx = jnp.asarray(embeds["pos_context"], dtype=jnp_dtype)
+        pos_mask = jnp.asarray(embeds["pos_txtmask"], dtype=jnp.bool_)
+        neg_ctx = jnp.asarray(embeds["neg_context"], dtype=jnp_dtype) if do_cfg else None
+        neg_mask = jnp.asarray(embeds["neg_txtmask"], dtype=jnp.bool_) if do_cfg else None
         if mesh is None:
-            lat_in = jax.device_put(lat_in, dev0)
-        t0 = time.perf_counter()
-        out_lat = denoise_fn(dit_params, lat_in, pos_ctx, pos_mask, neg_ctx, neg_mask, ts_j)
-        out_lat.block_until_ready()
-        dt = time.perf_counter() - t0
-        run_times.append(round(dt, 4))
-        if run_idx == 0:
-            final_latents_np = np.asarray(out_lat, dtype=np.float32)
-        del out_lat
+            pos_ctx, pos_mask = jax.device_put((pos_ctx, pos_mask), dev0)
+            if do_cfg:
+                neg_ctx, neg_mask = jax.device_put((neg_ctx, neg_mask), dev0)
 
-    dit_mem = _memory_stats_gib(dev0)
-    del dit_params, pos_ctx, pos_mask, neg_ctx, neg_mask, ts_j
+        n_runs = args.runs if len(embeds_list) == 1 else 1
+        saved_lat = None
+        for r_idx in range(n_runs):
+            lat_in = jnp.asarray(init_lat_np, dtype=jnp.float32)
+            if mesh is None:
+                lat_in = jax.device_put(lat_in, dev0)
+            t0 = time.perf_counter()
+            out_lat = denoise_fn(dit_params, lat_in, pos_ctx, pos_mask, neg_ctx, neg_mask, ts_j)
+            out_lat.block_until_ready()
+            dt = time.perf_counter() - t0
+            all_run_times.append(round(dt, 4))
+            if r_idx == 0:
+                saved_lat = np.asarray(out_lat, dtype=np.float32)
+            release_tpu_pytree(out_lat)
+        assert saved_lat is not None
+        final_latents_list.append(saved_lat)
+        release_tpu_pytree((pos_ctx, pos_mask, neg_ctx, neg_mask))
+
+    dit_hbm_peak = _memory_stats_gib(dev0)
+    dit_drop_sec, dit_freed = release_tpu_pytree((dit_params, ts_j))
+    del dit_params, ts_j
     gc.collect()
+    dit_hbm_after = _memory_stats_gib(dev0)
+    dit_host_after = host_memory_stats_gib()
 
-    warm_times = run_times[1:] if len(run_times) > 1 else run_times
+    warm_times = all_run_times[1:] if len(all_run_times) > 1 else all_run_times
     warm_median = float(statistics.median(warm_times))
     step_tflops = estimate_step_tflops(
         dit_cfg,
         width=args.width,
         height=args.height,
-        txt_len=int(embeds["pos_txtmask"].shape[1]),
+        txt_len=int(embeds_list[0]["pos_txtmask"].shape[1]),
         pad_multiple=max(256, args.splash_tile) if attn_impl in ("splash", "flash") else 256,
         batch_size=args.num_images,
         do_cfg=do_cfg,
@@ -418,45 +492,62 @@ def run_generate(args) -> dict[str, Any]:
     stage2_metrics = {
         "attn_impl": attn_impl,
         "splash_tile": args.splash_tile if attn_impl in ("splash", "flash") else None,
-        "load_seconds": round(dit_load_sec, 3),
-        "run_seconds": run_times,
-        "cold_seconds": run_times[0],
+        "load_and_h2d_seconds": round(dit_load_sec, 3),
+        "drop_tpu_seconds": round(dit_drop_sec, 4),
+        "freed_leaves": dit_freed,
+        "run_seconds": all_run_times,
+        "cold_seconds": all_run_times[0],
         "warm_median_seconds": round(warm_median, 4),
         "warm_ms_per_step": round(warm_median * 1000.0 / args.steps, 2),
         "step_tflops_est": round(step_tflops, 2),
         "achieved_tflops": round(achieved_tflops, 2),
         "mfu_pct_bf16": mfu_pct,
-        "latents_has_nan": bool(np.isnan(final_latents_np).any()),
-        "latents_mean": round(float(np.mean(final_latents_np)), 5),
-        "latents_std": round(float(np.std(final_latents_np)), 5),
-        "memory_stats_peak": dit_mem,
+        "latents_has_nan": any(bool(np.isnan(x).any()) for x in final_latents_list),
+        "latents_mean": round(float(np.mean(final_latents_list[0])), 5),
+        "latents_std": round(float(np.std(final_latents_list[0])), 5),
+        "hbm_before": dit_hbm_before,
+        "hbm_peak": dit_hbm_peak,
+        "hbm_after_drop": dit_hbm_after,
+        "host_mem_before": dit_host_before,
+        "host_mem_after": dit_host_after,
     }
     print(f"[stage2:dit] {json.dumps(stage2_metrics)}", flush=True)
 
-    # --- Stage 3: VAE Decode ---
-    t_vae0 = time.perf_counter()
-    vae_cfg, vae_params = load_vae_decoder_weights(model_root, dtype=args.vae_dtype, device=dev0)
-    jax.block_until_ready(vae_params)
-    vae_load_sec = time.perf_counter() - t_vae0
+    # --- Stage 3: VAE Decode (already resident on TPU if >= 20 GiB HBM) ---
+    if vae_params is None:
+        t_vae0 = time.perf_counter()
+        vae_cfg, vae_params = load_vae_decoder_weights(model_root, dtype=args.vae_dtype, device=dev0)
+        jax.block_until_ready(vae_params)
+        vae_load_sec = time.perf_counter() - t_vae0
 
     decode_fn = make_vae_decode_fn(vae_cfg, q_chunk_size=args.vae_attn_chunk)
-    lat_j = jax.device_put(jnp.asarray(final_latents_np, dtype=jnp.float32), dev0)
-    t_dec0 = time.perf_counter()
-    pixels_j = decode_fn(vae_params, lat_j)
-    pixels_j.block_until_ready()
-    vae_decode_sec = time.perf_counter() - t_dec0
-    pixels_np = np.asarray(pixels_j, dtype=np.float32)
+    saved_paths: list[str] = []
+    decode_times: list[float] = []
+    has_nan_pix = False
+    img_counter = 0
+    for lat_np in final_latents_list:
+        lat_j = jax.device_put(jnp.asarray(lat_np, dtype=jnp.float32), dev0)
+        t_dec0 = time.perf_counter()
+        pixels_j = decode_fn(vae_params, lat_j)
+        pixels_j.block_until_ready()
+        decode_times.append(round(time.perf_counter() - t_dec0, 4))
+        pixels_np = np.asarray(pixels_j, dtype=np.float32)
+        has_nan_pix = has_nan_pix or bool(np.isnan(pixels_np).any())
+        saved_paths.extend(_save_images(pixels_np, args.output, start_idx=img_counter))
+        img_counter += pixels_np.shape[0]
+        release_tpu_pytree((pixels_j, lat_j))
 
-    saved_paths = _save_images(pixels_np, args.output)
     vae_mem = _memory_stats_gib(dev0)
-    del vae_params, pixels_j, lat_j
+    release_tpu_pytree(vae_params)
+    del vae_params
     gc.collect()
 
     stage3_metrics = {
         "vae_dtype": args.vae_dtype,
+        "resident_vae": resident_vae,
         "load_seconds": round(vae_load_sec, 3),
-        "decode_seconds": round(vae_decode_sec, 3),
-        "pixels_has_nan": bool(np.isnan(pixels_np).any()),
+        "decode_seconds": decode_times,
+        "pixels_has_nan": has_nan_pix,
         "saved_images": saved_paths,
         "memory_stats_peak": vae_mem,
     }
@@ -467,7 +558,7 @@ def run_generate(args) -> dict[str, Any]:
         "device_kind": device_kind,
         "active_tp_devices": len(active_devs),
         "peak_bf16_tflops": peak_tflops,
-        "prompt": args.prompt,
+        "prompts": prompt_list,
         "width": args.width,
         "height": args.height,
         "steps": args.steps,
@@ -475,6 +566,7 @@ def run_generate(args) -> dict[str, Any]:
         "mu": args.mu,
         "seed": args.seed,
         "dtype": args.dtype,
+        "model_cache": cache_info,
         "stage1_text_encoder": stage1_metrics,
         "stage2_dit": stage2_metrics,
         "stage3_vae": stage3_metrics,
@@ -493,14 +585,16 @@ def run_bench(args) -> dict[str, Any]:
 
     from tpu_jax.dit import make_denoise_fn
     from tpu_jax.scheduler import compute_timesteps, estimate_step_tflops
-    from tpu_jax.weights import load_dit_weights
+    from tpu_jax.weights import load_dit_weights, release_tpu_pytree
 
     dev0, mesh, active_devs = _configure_jax(args)
     device_kind = getattr(dev0, "device_kind", str(dev0))
     peak_tflops = _tpu_peak_bf16_tflops(device_kind, len(active_devs))
-    model_root = _resolve_model_root(args)
 
-    # Load or synthesize embeddings (no need to burn Stage 1 time if benchmarking pure DiT speed)
+    need_te = not (args.prompt_embeds or args.synthetic_embeds)
+    comps: tuple[str, ...] = ("dit", "text_encoder", "tokenizer") if need_te else ("dit",)
+    model_root, cache_info = _resolve_model_root(args, components=comps)
+
     if args.prompt_embeds:
         data = np.load(args.prompt_embeds, allow_pickle=False)
         pos_ctx_np = data["pos_context"]
@@ -512,16 +606,17 @@ def run_bench(args) -> dict[str, Any]:
         pos_mask_np[:, :48] = True
         pos_mask_np[:, -5:] = True
     else:
-        embeds, _ = _encode_prompts_stage1(
+        embeds_list, _ = _encode_prompts_stage1(
             model_root,
-            [args.prompt],
+            [[args.prompt]],
             None,
             dtype=args.dtype,
             device=dev0,
+            num_workers=args.load_workers,
             text_attn_impl="xla" if dev0.platform == "tpu" else "einsum",
         )
-        pos_ctx_np = embeds["pos_context"]
-        pos_mask_np = embeds["pos_txtmask"]
+        pos_ctx_np = embeds_list[0]["pos_context"]
+        pos_mask_np = embeds_list[0]["pos_txtmask"]
 
     t_load0 = time.perf_counter()
     dit_path = Path(args.dit_path) if args.dit_path else model_root
@@ -530,6 +625,7 @@ def run_bench(args) -> dict[str, Any]:
         dtype=args.dtype,
         device=None if mesh is not None else dev0,
         mesh=mesh,
+        num_workers=args.load_workers,
     )
     jax.block_until_ready(dit_params)
     load_sec = time.perf_counter() - t_load0
@@ -591,7 +687,7 @@ def run_bench(args) -> dict[str, Any]:
                         run_times.append(round(time.perf_counter() - t0, 4))
                         if r_idx == 0:
                             last_lat = np.asarray(out, dtype=np.float32)
-                        del out
+                        release_tpu_pytree(out)
                 except Exception as exc:
                     err = f"{type(exc).__name__}: {exc}"
 
@@ -642,7 +738,8 @@ def run_bench(args) -> dict[str, Any]:
         "device_kind": device_kind,
         "active_tp_devices": len(active_devs),
         "peak_bf16_tflops": peak_tflops,
-        "load_seconds": round(load_sec, 3),
+        "model_cache": cache_info,
+        "load_and_h2d_seconds": round(load_sec, 3),
         "cases": cases,
     }
     if args.save_report:
@@ -661,12 +758,16 @@ def run_parity(args) -> dict[str, Any]:
     from tpu_jax.weights import load_dit_weights
 
     dev0, mesh, _ = _configure_jax(args)
-    model_root = _resolve_model_root(args)
+    model_root, cache_info = _resolve_model_root(args, components=("dit",))
     dit_path = Path(args.dit_path) if args.dit_path else model_root
 
     t0 = time.perf_counter()
     dit_cfg, dit_params = load_dit_weights(
-        dit_path, dtype=args.dtype, device=None if mesh is not None else dev0, mesh=mesh
+        dit_path,
+        dtype=args.dtype,
+        device=None if mesh is not None else dev0,
+        mesh=mesh,
+        num_workers=args.load_workers,
     )
     jax.block_until_ready(dit_params)
     load_sec = time.perf_counter() - t0
@@ -735,7 +836,8 @@ def run_parity(args) -> dict[str, Any]:
 
     report = {
         "device_kind": getattr(dev0, "device_kind", str(dev0)),
-        "load_seconds": round(load_sec, 3),
+        "model_cache": cache_info,
+        "load_and_h2d_seconds": round(load_sec, 3),
         "single_forward_warm_ms": timings_ms,
         "comparisons": comparisons,
         "memory_stats": _memory_stats_gib(dev0),
@@ -750,10 +852,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", type=str, default=None, help="Local model snapshot directory")
     p.add_argument("--dit-path", type=str, default=None, help="Optional explicit turbo.safetensors / transformer/ path")
     p.add_argument("--hf-repo", type=str, default=None, help="HuggingFace repo id (e.g. krea/Krea-2-Turbo)")
-    p.add_argument("--download-dir", type=str, default="/dev/shm/krea-2-turbo", help="Target dir for --hf-repo")
+    p.add_argument("--download-dir", type=str, default=None, help="Fallback disk dir when RAM tmpfs is unavailable")
+    p.add_argument("--disk-cache", action="store_true", help="Disable RAM tmpfs cache and download to disk")
+    p.add_argument("--local-files-only", action="store_true", help="Offline mode (reuse cached snapshot only)")
     p.add_argument("--hf-token", type=str, default=None)
     p.add_argument("--hf-token-file", type=str, default=None)
     p.add_argument("--prompt", type=str, default="A red fox sitting in fresh snow, golden hour, photorealistic")
+    p.add_argument("--prompts-file", type=str, default=None, help="File with one prompt per line (single stage load)")
     p.add_argument("--negative-prompt", type=str, default="")
     p.add_argument("--prompt-embeds", type=str, default=None, help="Optional cached .npz prompt embeddings")
     p.add_argument("--save-embeds", type=str, default=None, help="Save Stage 1 embeddings to .npz")
@@ -770,7 +875,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--dtype", choices=("bf16", "bfloat16", "fp32", "float32"), default="bf16")
     p.add_argument("--vae-dtype", choices=("bf16", "bfloat16", "fp32", "float32"), default="bf16")
+    p.add_argument("--resident-vae", choices=("auto", "on", "off"), default="auto")
     p.add_argument("--vae-attn-chunk", type=int, default=1024)
+    p.add_argument("--load-workers", type=int, default=None, help="Parallel CPU threads for safetensors streaming")
     p.add_argument("--attn-impl", choices=("auto", "splash", "flash", "xla", "einsum"), default="auto")
     p.add_argument("--attn-impls", type=str, default="splash,flash,xla")
     p.add_argument("--splash-tile", type=int, default=512)
