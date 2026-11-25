@@ -538,8 +538,16 @@ class TestRunnerAndSplashHelpers(unittest.TestCase):
         self.assertEqual(_benchmark_tile_configs(args, impls[0], 848, 1200), [(256, 2048, 512)])
         self.assertEqual(_benchmark_tile_configs(args, impls[0], 1696, 2400), [(256, 2048, 1024)])
         opts = _pallas_options(args)
-        self.assertTrue(opts.fast_exp2 and opts.continuous_kv and opts.lazy_rescale)
+        self.assertTrue(opts.continuous_kv)
+        self.assertFalse(opts.fast_exp2)
+        self.assertFalse(opts.lazy_rescale)
         self.assertEqual(opts.vmem_limit_bytes, 48 * 1024**2)
+        all_args = parser.parse_args([
+            "--attn-impl", "pallas_gqa", "--pallas-gqa-optimize",
+            "--pallas-gqa-fast-exp2", "--pallas-gqa-lazy-rescale",
+        ])
+        all_opts = _pallas_options(all_args)
+        self.assertTrue(all_opts.fast_exp2 and all_opts.continuous_kv and all_opts.lazy_rescale)
         with patch.dict(os.environ, {"LIBTPU_INIT_ARGS": "--other --xla_tpu_scoped_vmem_limit_kib=32768"}):
             _configure_pallas_vmem(opts)
             self.assertEqual(os.environ["LIBTPU_INIT_ARGS"], "--other --xla_tpu_scoped_vmem_limit_kib=65536")

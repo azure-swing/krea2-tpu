@@ -24,6 +24,17 @@ class TestPallasGqaAttention(unittest.TestCase):
             np.asarray(_approx_exp2(jnp.array([-jnp.inf, -127.0, -1.0, 0.0, 1.0]))),
             [0.0, 0.0, 0.5, 1.0, 2.0],
         )
+        non_pos = np.linspace(-126, 0, 16385, dtype=np.float32)
+        np.testing.assert_allclose(
+            np.asarray(jax.jit(partial(_approx_exp2, non_positive=True))(jnp.asarray(non_pos)), dtype=np.float64),
+            np.exp2(non_pos.astype(np.float64)),
+            rtol=1.2e-4,
+            atol=0.0,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(_approx_exp2(jnp.array([-jnp.inf, -127.0, -1.0, 0.0]), non_positive=True)),
+            [0.0, 0.0, 0.5, 1.0],
+        )
 
     def test_checked_anchor_replays_large_logits(self):
         anchor = jnp.zeros((2, 1))
@@ -224,6 +235,20 @@ class TestPallasGqaAttention(unittest.TestCase):
                     ))
                     lowered = fn.trace(q, kv, kv, mask).lower(lowering_platforms=("tpu",))
                     self.assertIn("stablehlo.custom_call", lowered.as_text())
+        with self.subTest(seq_len=4608, tail_lt_compute_kv=True), use_abstract_mesh(mesh):
+            q = jax.ShapeDtypeStruct((1, 12, 4608, 4, 128), jnp.bfloat16)
+            kv = jax.ShapeDtypeStruct((1, 12, 4608, 128), jnp.bfloat16)
+            fn = jax.jit(partial(
+                pallas_gqa_attention,
+                block_q=256,
+                block_kv=2048,
+                block_kv_compute=512,
+                static_valid_len=4296,
+                grouped_q=True,
+                options=PallasGqaOptions(True, True, True, 48 * 1024**2),
+            ))
+            lowered = fn.trace(q, kv, kv, None).lower(lowering_platforms=("tpu",))
+            self.assertIn("stablehlo.custom_call", lowered.as_text())
 
 
 if __name__ == "__main__":

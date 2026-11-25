@@ -532,11 +532,12 @@ def _gqa_attention(
         q_g = q.astype(jnp.float32).reshape(batch, seq_len, num_kv_heads, group_size, head_dim)
         k_f = k.astype(jnp.float32)
         v_f = v.astype(jnp.float32)
-        logits = jnp.einsum("bskgd,btkd->bkgst", q_g, k_f)
+        prec = lax.Precision.HIGHEST if q.dtype == jnp.float32 else None
+        logits = jnp.einsum("bskgd,btkd->bkgst", q_g, k_f, precision=prec)
         if valid_mask is not None:
             logits = jnp.where(valid_mask[:, None, None, None, :], logits, jnp.float32(-1e30))
         weights = jax.nn.softmax(logits, axis=-1)
-        out = jnp.einsum("bkgst,btkd->bskgd", weights, v_f).astype(v.dtype)
+        out = jnp.einsum("bkgst,btkd->bskgd", weights, v_f, precision=prec).astype(v.dtype)
         return out.reshape(batch, seq_len, out_dim)
 
     raise ValueError(f"Unknown attn_impl={attn_impl!r}; expected one of {VALID_ATTN_IMPLS}.")

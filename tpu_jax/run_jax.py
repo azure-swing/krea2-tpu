@@ -164,10 +164,13 @@ def _pallas_options(args) -> PallasGqaOptions:
         vmem_mib = 48
     if vmem_mib is not None and not 1 <= vmem_mib <= 127:
         raise ValueError("--pallas-gqa-vmem-mib must be between 1 and 127 on TPU v6e.")
+    # On TPU v6e, continuous double-buffered KV prefetch is a clear win while
+    # software cubic exp2 is slower than hardware jnp.exp2; keep fast_exp2 and
+    # lazy_rescale opt-in via their dedicated flags.
     return PallasGqaOptions(
-        fast_exp2=optimize or getattr(args, "pallas_gqa_fast_exp2", False),
+        fast_exp2=getattr(args, "pallas_gqa_fast_exp2", False),
         continuous_kv=optimize or getattr(args, "pallas_gqa_continuous_kv", False),
-        lazy_rescale=optimize or getattr(args, "pallas_gqa_lazy_rescale", False),
+        lazy_rescale=getattr(args, "pallas_gqa_lazy_rescale", False),
         vmem_limit_bytes=None if vmem_mib is None else vmem_mib * 1024**2,
     )
 

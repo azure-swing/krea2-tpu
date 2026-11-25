@@ -19,16 +19,18 @@ _GROUP_SIZE = 4
 _DOT_NT = (((1,), (1,)), ((), ()))
 
 
-def _approx_exp2(x):
+def _approx_exp2(x, *, non_positive: bool = False):
     """Endpoint-constrained cubic, about 1.1e-4 relative error on normal results."""
-    bounded = jnp.clip(x, -126.0, 127.0)
+    # Clamping at -127 maps underflow/masked entries to (-127 + 127) << 23 == +0.0f,
+    # avoiding a separate zero-masking select.
+    bounded = jnp.maximum(x, -127.0) if non_positive else jnp.clip(x, -127.0, 127.0)
     whole = jnp.floor(bounded)
     fraction = bounded - whole
     # The fractional polynomial is exactly 1 and 2 at the respective endpoints.
     poly = ((0.07826797 * fraction + 0.22630768) * fraction + 0.69542435) * fraction + 1.0
     scale = lax.bitcast_convert_type((whole.astype(jnp.int32) + 127) << 23, jnp.float32)
-    value = jnp.where(x < -126.0, 0.0, poly * scale)
-    return jnp.where(x > 127.0, jnp.inf, value)
+    value = poly * scale
+    return value if non_positive else jnp.where(x > 127.0, jnp.inf, value)
 
 
 def _dot(lhs, rhs):
@@ -47,14 +49,23 @@ def _attention_logits(q, k, mask, valid):
 
 
 def _softmax_update(logits, m, denom, dtype, *, dynamic_mask, options):
-    exp2 = _approx_exp2 if options.fast_exp2 else jnp.exp2
+    q_rows, kv_cols = logits.shape
+    lane_replicated = m.shape[1] == _HEAD_DIM
+    lane_repeats = kv_cols // _HEAD_DIM
+
+    def _expand_stat(x):
+        return jnp.broadcast_to(x, (q_rows, _HEAD_DIM)) if lane_replicated else x
+
+    def _tile_stat(x):
+        return jnp.tile(x, (1, lane_repeats)) if lane_replicated else x
 
     def online():
-        next_m = jnp.maximum(m, jnp.max(logits, axis=1, keepdims=True))
+        next_m = jnp.maximum(m, _expand_stat(jnp.max(logits, axis=1, keepdims=True)))
         safe_m = jnp.where(next_m == -jnp.inf, 0.0, next_m) if dynamic_mask else next_m
         alpha = jnp.exp2(m - safe_m)
-        p = exp2(logits - safe_m)
-        denom_next = denom * alpha + jnp.sum(p, axis=1, keepdims=True)
+        shifted = logits - _tile_stat(safe_m)
+        p = _approx_exp2(shifted, non_positive=True) if options.fast_exp2 else jnp.exp2(shifted)
+        denom_next = denom * alpha + _expand_stat(jnp.sum(p, axis=1, keepdims=True))
         return next_m, denom_next, p.astype(dtype), alpha, jnp.bool_(True)
 
     if not options.lazy_rescale:
@@ -62,11 +73,12 @@ def _softmax_update(logits, m, denom, dtype, *, dynamic_mask, options):
 
     # A bounded sum also bounds all individual weights. Nonfinite sums (including
     # an uninitialized anchor) and outliers replay the tile with a fresh maximum.
-    p = exp2(logits - m)
-    tile_sum = jnp.sum(p, axis=1, keepdims=True)
+    shifted = logits - _tile_stat(m)
+    p = _approx_exp2(shifted, non_positive=False) if options.fast_exp2 else jnp.exp2(shifted)
+    tile_sum_1 = jnp.sum(p, axis=1, keepdims=True)
     return lax.cond(
-        jnp.all(tile_sum <= 65536.0),
-        lambda: (m, denom + tile_sum, p.astype(dtype), jnp.ones_like(m), jnp.bool_(False)),
+        jnp.all(tile_sum_1 <= 65536.0),
+        lambda: (m, denom + _expand_stat(tile_sum_1), p.astype(dtype), jnp.ones_like(m), jnp.bool_(False)),
         online,
     )
 
@@ -189,7 +201,7 @@ def _continuous_kernel(
         transfer.start()
     for transfer in first_transfers:
         transfer.wait()
-    low = jnp.full((q.shape[0], 1), -jnp.inf, dtype=jnp.float32)
+    low = jnp.full((q.shape[0], _HEAD_DIM), -jnp.inf, dtype=jnp.float32)
     zero = jnp.zeros_like(low)
     m, denom, p, alpha, rescale = prepare(logits_at(0, 0, tail if pages == 1 and tail else None), low, zero)
     state = (m, denom, jnp.zeros(q.shape, dtype=jnp.float32), p, alpha, rescale)
@@ -202,14 +214,20 @@ def _continuous_kernel(
             transfer.start()
         for sub in range(1, subtile_count):
             state = advance(state, slot, sub - 1, slot, sub, None)
-        # When the final page starts with a partial tile, mask it before
-        # carrying that tile's probabilities into the next iteration.
+        # When the final page starts with a partial tile, complete the DMA wait
+        # outside lax.cond and only branch on the masked vs unmasked logits tile.
         if tail and tail < compute_kv:
-            return lax.cond(
+            m, denom, numerator, p, alpha, rescale = state
+            pv = project(p, slot, subtile_count - 1)
+            for transfer in transfers:
+                transfer.wait()
+            logits = lax.cond(
                 page == pages - 2,
-                lambda: advance(state, slot, subtile_count - 1, next_slot, 0, tail, transfers),
-                lambda: advance(state, slot, subtile_count - 1, next_slot, 0, None, transfers),
+                lambda: logits_at(next_slot, 0, tail),
+                lambda: logits_at(next_slot, 0, None),
             )
+            m, denom, next_p, next_alpha, next_rescale = prepare(logits, m, denom)
+            return m, denom, update(numerator, pv, alpha, rescale), next_p, next_alpha, next_rescale
         return advance(state, slot, subtile_count - 1, next_slot, 0, None, transfers)
 
     state = lax.fori_loop(0, pages - 1, process_page, state)
@@ -322,8 +340,8 @@ def pallas_gqa_attention(
             pl.BlockSpec((None, head_dim, block_kv), lambda head, _, j: (head, 0, j)),
             mask_spec,
         )
-        stats = pltpu.VMEM((q_rows, 1), jnp.float32)
-        scratch = (stats, stats, pltpu.VMEM((q_rows, head_dim), jnp.float32))
+        stats = pltpu.VMEM((q_rows, head_dim), jnp.float32)
+        scratch = (stats, stats, stats)
         grid += (kv_padded // block_kv,)
         semantics = ("parallel", "parallel", "arbitrary")
     out = pl.pallas_call(

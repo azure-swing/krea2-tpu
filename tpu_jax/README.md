@@ -68,14 +68,15 @@ softmax work. It consumes sequence-minor V and skips empty tiles for static
 prefix masks. BF16 Q scaling and the reordered computation can change rounding.
 
 The v6e defaults are `256×2048×512` at 1K and `256×2048×1024` at 2K.
-Add `--pallas-gqa-optimize` to enable continuous double-buffered KV prefetch,
-checked lazy rescaling, cubic `exp2` for the softmax weights, and a 48 MiB
-kernel VMEM budget together. For individual measurements, use
-`--pallas-gqa-continuous-kv`, `--pallas-gqa-lazy-rescale`,
-`--pallas-gqa-fast-exp2`, or `--pallas-gqa-vmem-mib 48`. The VMEM option
-raises the process-level libtpu limit before backend initialization. The cubic
-approximation keeps exact `exp2` for the accumulator scale and can change
-BF16 results. QNorm and RoPE produce the grouped Q layout directly.
+Add `--pallas-gqa-optimize` to enable continuous double-buffered KV prefetch
+and a 48 MiB kernel VMEM budget together (hardware `jnp.exp2` outperformed the
+software cubic approximation on v6e, so `--pallas-gqa-fast-exp2` and
+`--pallas-gqa-lazy-rescale` remain opt-in flags for individual ablation). For
+individual measurements, use `--pallas-gqa-continuous-kv`,
+`--pallas-gqa-lazy-rescale`, `--pallas-gqa-fast-exp2`, or
+`--pallas-gqa-vmem-mib 48`. The VMEM option raises the process-level libtpu
+limit before backend initialization. QNorm and RoPE produce the grouped Q
+layout directly.
 
 Run the synthetic batch-1 benchmark on v6e without downloading weights.
 
