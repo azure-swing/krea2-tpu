@@ -23,9 +23,12 @@ import argparse
 import gc
 import json
 import math
+import os
+import re
 import statistics
 import sys
 import time
+from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -36,8 +39,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tpu_jax.config import PallasGqaOptions
+
 PREFIX_MASK_ATTN_IMPLS = ("splash", "pallas_gqa")
 TILED_ATTN_IMPLS = (*PREFIX_MASK_ATTN_IMPLS, "flash")
+_DEFAULT_SPLASH_CONFIGS = "512x1024x512,1024x1024x512,1024x2048x512"
 
 
 def _tpu_peak_bf16_tflops(device_kind: str, num_chips: int = 1) -> float | None:
@@ -85,6 +91,7 @@ def _resolve_splash_config(
     *,
     width: int,
     height: int,
+    attn_impl: str = "splash",
 ) -> tuple[int, int, int]:
     """Resolve ``(block_q, block_kv, block_kv_compute)`` from CLI flags and resolution.
 
@@ -93,15 +100,19 @@ def _resolve_splash_config(
     - 2K (>=2.25 MP): 1024x2048x512
     """
     is_hi_res = (width * height) >= (1536 * 1536)
+    if attn_impl == "pallas_gqa":
+        defaults = (256, 2048, 1024 if is_hi_res else 512)
+    else:
+        defaults = (1024, 2048 if is_hi_res else 1024, 512)
     base = args.splash_tile
     if base is not None:
         bq = args.splash_block_q if args.splash_block_q is not None else base
         bkv = args.splash_block_kv if args.splash_block_kv is not None else base
         bkvc = args.splash_block_kv_compute if args.splash_block_kv_compute is not None else min(bq, bkv)
     else:
-        bq = args.splash_block_q if args.splash_block_q is not None else 1024
-        bkv = args.splash_block_kv if args.splash_block_kv is not None else (2048 if is_hi_res else 1024)
-        bkvc = args.splash_block_kv_compute if args.splash_block_kv_compute is not None else 512
+        bq = args.splash_block_q if args.splash_block_q is not None else defaults[0]
+        bkv = args.splash_block_kv if args.splash_block_kv is not None else defaults[1]
+        bkvc = args.splash_block_kv_compute if args.splash_block_kv_compute is not None else defaults[2]
     return int(bq), int(bkv), int(bkvc)
 
 
@@ -125,11 +136,64 @@ def _parse_splash_configs(spec: str | None, fallback_tiles: str) -> list[tuple[i
     return [(int(x.strip()), int(x.strip()), int(x.strip())) for x in fallback_tiles.split(",") if x.strip()]
 
 
+def _benchmark_tile_configs(args, attn_impl: str, width: int, height: int) -> list[tuple[int, int, int]]:
+    if attn_impl == "pallas_gqa" and args.splash_configs is None:
+        return [_resolve_splash_config(args, width=width, height=height, attn_impl=attn_impl)]
+    return _parse_splash_configs(
+        _DEFAULT_SPLASH_CONFIGS if args.splash_configs is None else args.splash_configs, args.splash_tiles
+    )
+
+
+def _requested_attn_impls(args) -> list[str]:
+    return (
+        [args.attn_impl]
+        if args.attn_impl != "auto"
+        else [impl.strip() for impl in args.attn_impls.split(",") if impl.strip()]
+    )
+
+
+def _benchmark_batch_sizes(args, attn_impls: list[str]) -> list[int]:
+    default = "1" if attn_impls == ["pallas_gqa"] else "1,2,4"
+    return _parse_int_list(args.batch_sizes if args.batch_sizes is not None else default)
+
+
+def _pallas_options(args) -> PallasGqaOptions:
+    optimize = getattr(args, "pallas_gqa_optimize", False)
+    vmem_mib = getattr(args, "pallas_gqa_vmem_mib", None)
+    if vmem_mib is None and optimize:
+        vmem_mib = 48
+    if vmem_mib is not None and not 1 <= vmem_mib <= 127:
+        raise ValueError("--pallas-gqa-vmem-mib must be between 1 and 127 on TPU v6e.")
+    return PallasGqaOptions(
+        fast_exp2=optimize or getattr(args, "pallas_gqa_fast_exp2", False),
+        continuous_kv=optimize or getattr(args, "pallas_gqa_continuous_kv", False),
+        lazy_rescale=optimize or getattr(args, "pallas_gqa_lazy_rescale", False),
+        vmem_limit_bytes=None if vmem_mib is None else vmem_mib * 1024**2,
+    )
+
+
+def _configure_pallas_vmem(options: PallasGqaOptions) -> None:
+    if options.vmem_limit_bytes is None:
+        return
+    flag = "--xla_tpu_scoped_vmem_limit_kib"
+    args = os.environ.get("LIBTPU_INIT_ARGS", "")
+    match = re.search(rf"(?<!\S){flag}(?:=|\s+)(\d+)(?=\s|$)", args)
+    kernel_kib = options.vmem_limit_bytes // 1024
+    if match is not None and int(match[1]) > kernel_kib:
+        return
+    # Leave at least one increment of headroom for XLA, within the v6e limit.
+    global_kib = min(131008, (kernel_kib // 16384 + 1) * 16384)
+    if match is not None:
+        args = args[:match.start()] + args[match.end():]
+    os.environ["LIBTPU_INIT_ARGS"] = f"{args.strip()} {flag}={global_kib}".strip()
+
+
 def _parse_int_list(spec: str) -> list[int]:
     return [int(x.strip()) for x in spec.split(",") if x.strip()]
 
 
 def _configure_jax(args) -> tuple[Any, Any | None, list[Any]]:
+    _configure_pallas_vmem(_pallas_options(args))
     import jax
     from jax.sharding import Mesh
 
@@ -581,7 +645,8 @@ def run_generate(args) -> dict[str, Any]:
     if attn_impl == "auto":
         attn_impl = "splash" if (dev0.platform == "tpu" and mesh is None) else "xla"
 
-    bq, bkv, bkvc = _resolve_splash_config(args, width=args.width, height=args.height)
+    bq, bkv, bkvc = _resolve_splash_config(args, width=args.width, height=args.height, attn_impl=attn_impl)
+    pallas_options = _pallas_options(args)
     compact_text = args.compact_text != "off"
     text_buckets = tuple(_parse_int_list(args.text_buckets))
     align = 8 * dit_cfg.patch
@@ -643,6 +708,7 @@ def run_generate(args) -> dict[str, Any]:
                 tp_size=tp_size,
                 latent_dtype=jnp.float32,
                 donate_latents=True,
+                pallas_options=pallas_options,
             )
         denoise_fn = denoise_fn_cache[cache_key]
 
@@ -742,6 +808,7 @@ def run_generate(args) -> dict[str, Any]:
 
     stage2_metrics = {
         "attn_impl": attn_impl,
+        "pallas_gqa_options": asdict(pallas_options) if attn_impl == "pallas_gqa" else None,
         "splash_blocks": f"{bq}x{bkv}x{bkvc}" if attn_impl in TILED_ATTN_IMPLS else None,
         "splash_mask_mode": "static" if used_static_mask else "segment",
         "compact_text": compact_text,
@@ -873,7 +940,8 @@ def run_bench(args) -> dict[str, Any]:
     comps: tuple[str, ...] = ("dit", "text_encoder", "tokenizer") if need_te else ("dit",)
     model_root, cache_info = _resolve_model_root(args, components=comps)
 
-    batch_sizes = _parse_int_list(args.batch_sizes)
+    attn_impls = _requested_attn_impls(args)
+    batch_sizes = _benchmark_batch_sizes(args, attn_impls)
 
     if args.prompt_embeds:
         with np.load(args.prompt_embeds, allow_pickle=False) as data:
@@ -928,8 +996,7 @@ def run_bench(args) -> dict[str, Any]:
     if mesh is None:
         pos_ctx, pos_mask = jax.device_put((pos_ctx, pos_mask), dev0)
 
-    attn_impls = [x.strip() for x in args.attn_impls.split(",") if x.strip()]
-    splash_cfgs = _parse_splash_configs(args.splash_configs, args.splash_tiles)
+    pallas_options = _pallas_options(args)
     mask_modes = [x.strip() for x in args.splash_mask_modes.split(",") if x.strip()]
     scan_unrolls = _parse_int_list(args.scan_unrolls)
     resolutions = []
@@ -961,7 +1028,10 @@ def run_bench(args) -> dict[str, Any]:
             )
             for attn_impl in attn_impls:
                 prefix_mask = attn_impl in PREFIX_MASK_ATTN_IMPLS
-                cfgs = splash_cfgs if attn_impl in TILED_ATTN_IMPLS else [(512, 512, 512)]
+                cfgs = (
+                    _benchmark_tile_configs(args, attn_impl, width, height)
+                    if attn_impl in TILED_ATTN_IMPLS else [(512, 512, 512)]
+                )
                 m_modes = mask_modes if prefix_mask else ["segment"]
                 for bq, bkv, bkvc in cfgs:
                     for m_mode in m_modes:
@@ -987,6 +1057,7 @@ def run_bench(args) -> dict[str, Any]:
                                 tp_size=tp_size,
                                 latent_dtype=jnp.float32,
                                 donate_latents=True,
+                                pallas_options=pallas_options,
                             )
                             run_times = []
                             err = None
@@ -1067,6 +1138,7 @@ def run_bench(args) -> dict[str, Any]:
         "device_kind": device_kind,
         "active_tp_devices": tp_size,
         "peak_bf16_tflops": peak_tflops,
+        "pallas_gqa_options": asdict(pallas_options) if "pallas_gqa" in attn_impls else None,
         "model_cache": cache_info,
         "load_and_h2d_seconds": round(load_sec, 3),
         "cases": cases,
@@ -1102,11 +1174,7 @@ def run_microbench(args) -> dict[str, Any]:
     from tpu_jax.scheduler import roundup
     from tpu_jax.weights import release_tpu_pytree
 
-    attn_impls = (
-        [args.attn_impl]
-        if args.attn_impl != "auto"
-        else [x.strip() for x in args.attn_impls.split(",") if x.strip()]
-    )
+    attn_impls = _requested_attn_impls(args)
     if not attn_impls or any(impl not in PREFIX_MASK_ATTN_IMPLS for impl in attn_impls):
         raise ValueError("Microbench expects splash or pallas_gqa attention.")
 
@@ -1160,9 +1228,9 @@ def run_microbench(args) -> dict[str, Any]:
             times.append((time.perf_counter() - t0) * 1000.0)
         return float(statistics.median(times))
 
-    splash_cfgs = _parse_splash_configs(args.splash_configs, args.splash_tiles)
+    pallas_options = _pallas_options(args)
     mask_modes = [x.strip() for x in args.splash_mask_modes.split(",") if x.strip()]
-    batch_sizes = _parse_int_list(args.batch_sizes)
+    batch_sizes = _benchmark_batch_sizes(args, attn_impls)
 
     results: list[dict[str, Any]] = []
     for bs in batch_sizes:
@@ -1211,6 +1279,7 @@ def run_microbench(args) -> dict[str, Any]:
 
         attn_flops = 4.0 * bs * seq_len * seq_len * d
         for impl in attn_impls:
+            splash_cfgs = _benchmark_tile_configs(args, impl, args.width, args.height)
             if impl == "pallas_gqa":
                 q_log2 = (q_in.astype(jnp.float32) * _LOG2_E).astype(q_in.dtype)
                 qkv = tuple(a.transpose(0, 2, 1, 3) for a in (q_log2, k_in, v_in))
@@ -1221,7 +1290,8 @@ def run_microbench(args) -> dict[str, Any]:
                     svl = valid_len if m_mode == "static" else None
                     if impl == "pallas_gqa":
                         attention = partial(
-                            _pallas_gqa, block_q=bq, block_kv=bkv, block_kv_compute=bkvc, static_valid_len=svl
+                            _pallas_gqa, block_q=bq, block_kv=bkv, block_kv_compute=bkvc, static_valid_len=svl,
+                            options=pallas_options,
                         )
                     else:
                         attention = partial(
@@ -1252,6 +1322,7 @@ def run_microbench(args) -> dict[str, Any]:
                     splash_block_kv=bkv,
                     splash_block_kv_compute=bkvc,
                     static_valid_len=valid_len if "static" in mask_modes else None,
+                    pallas_options=pallas_options,
                 )
             )
             total_blk_flops = (
@@ -1283,6 +1354,7 @@ def run_microbench(args) -> dict[str, Any]:
         "device_kind": device_kind,
         "microbench_devices": 1,
         "peak_bf16_tflops": peak_tflops,
+        "pallas_gqa_options": asdict(pallas_options) if "pallas_gqa" in attn_impls else None,
         "results": results,
     }
     if args.save_report:
@@ -1346,14 +1418,16 @@ def run_parity(args) -> dict[str, Any]:
     if mesh is None:
         pos_ctx, pos_mask, tok, t_val = jax.device_put((pos_ctx, pos_mask, tok, t_val), dev0)
 
-    bq, bkv, bkvc = _resolve_splash_config(args, width=args.width, height=args.height)
-    impls = [x.strip() for x in args.attn_impls.split(",") if x.strip()]
+    pallas_options = _pallas_options(args)
+    impls = _requested_attn_impls(args)
     lat_h, lat_w = args.height // 8, args.width // 8
     img_len = (lat_h // dit_cfg.patch) * (lat_w // dit_cfg.patch)
     static_vlen = (img_len + common_valid) if (common_valid is not None and args.splash_mask_mode != "segment") else None
     outputs = {}
     timings_ms = {}
     for impl in impls:
+        bq, bkv, bkvc = _resolve_splash_config(args, width=args.width, height=args.height, attn_impl=impl)
+
         @jax.jit
         def _single(p, x, t, c, m, _impl=impl):
             txt, cos, sin, jmask, pad_len = prepare_text_conditioning(
@@ -1376,6 +1450,7 @@ def run_parity(args) -> dict[str, Any]:
                 static_valid_len=static_vlen if _impl in PREFIX_MASK_ATTN_IMPLS else None,
                 scan_unroll=args.scan_unroll,
                 tp_size=tp_size,
+                pallas_options=pallas_options,
             )
 
         out = _single(dit_params, tok, t_val, pos_ctx, pos_mask)
@@ -1455,6 +1530,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--load-workers", type=int, default=None, help="Parallel CPU threads for safetensors streaming")
     p.add_argument("--attn-impl", choices=("auto", "splash", "flash", "xla", "einsum", "pallas_gqa"), default="auto")
     p.add_argument("--attn-impls", type=str, default="splash")
+    p.add_argument("--pallas-gqa-optimize", action="store_true", help="Enable all experimental Pallas GQA optimizations")
+    p.add_argument("--pallas-gqa-fast-exp2", action="store_true", help="Use a cubic approximation for softmax weights")
+    p.add_argument("--pallas-gqa-continuous-kv", action="store_true", help="Pipeline across full KV pages")
+    p.add_argument("--pallas-gqa-lazy-rescale", action="store_true", help="Defer rescaling with a checked softmax anchor")
+    p.add_argument("--pallas-gqa-vmem-mib", type=int, default=None, help="Pallas GQA scoped VMEM budget in MiB")
     p.add_argument("--splash-tile", type=int, default=None, help="Symmetric Splash tile shorthand (overrides auto)")
     p.add_argument("--splash-block-q", type=int, default=None, help="SplashAttention block_q (default: 1024)")
     p.add_argument("--splash-block-kv", type=int, default=None, help="SplashAttention block_kv (default: 1024@1K, 2048@2K)")
@@ -1463,7 +1543,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--splash-configs",
         type=str,
-        default="512x1024x512,1024x1024x512,1024x2048x512",
+        default=None,
         help="Comma-separated BQxBKVxBKVC configs for bench/microbench",
     )
     p.add_argument(
@@ -1477,7 +1557,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text-buckets", type=str, default="64,128,256,512", help="Static text bucket lengths")
     p.add_argument("--scan-unroll", type=int, default=1, help="lax.scan unroll factor across the 28 DiT layers")
     p.add_argument("--scan-unrolls", type=str, default="1", help="Unroll factors to sweep in bench (e.g. 1,2,4)")
-    p.add_argument("--batch-sizes", type=str, default="1,2,4", help="Batch sizes to sweep in bench/microbench")
+    p.add_argument("--batch-sizes", type=str, default=None, help="Batch sizes to sweep in bench/microbench")
     p.add_argument("--resolutions", type=str, default="1024x1024,2048x2048")
     p.add_argument("--tp", type=int, default=1, help="1D tensor parallel chips (1 for single v6e-1)")
     p.add_argument("--runs", type=int, default=2, help="1 cold + (runs-1) warm runs")

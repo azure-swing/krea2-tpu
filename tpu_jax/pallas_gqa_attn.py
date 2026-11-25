@@ -10,6 +10,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from tpu_jax.config import PallasGqaOptions
 from tpu_jax.scheduler import roundup
 
 
@@ -18,16 +19,71 @@ _GROUP_SIZE = 4
 _DOT_NT = (((1,), (1,)), ((), ()))
 
 
+def _approx_exp2(x):
+    """Endpoint-constrained cubic, about 1.1e-4 relative error on normal results."""
+    bounded = jnp.clip(x, -126.0, 127.0)
+    whole = jnp.floor(bounded)
+    fraction = bounded - whole
+    # The fractional polynomial is exactly 1 and 2 at the respective endpoints.
+    poly = ((0.07826797 * fraction + 0.22630768) * fraction + 0.69542435) * fraction + 1.0
+    scale = lax.bitcast_convert_type((whole.astype(jnp.int32) + 127) << 23, jnp.float32)
+    value = jnp.where(x < -126.0, 0.0, poly * scale)
+    return jnp.where(x > 127.0, jnp.inf, value)
+
+
+def _dot(lhs, rhs):
+    precision = lax.Precision.HIGHEST if lhs.dtype == jnp.float32 else None
+    return lax.dot_general(lhs, rhs, _DOT_NT, precision=precision, preferred_element_type=jnp.float32)
+
+
+def _attention_logits(q, k, mask, valid):
+    logits = _dot(q, k)
+    if mask is not None:
+        logits = jnp.where(mask != 0, logits, -jnp.inf)
+    elif valid is not None and valid < logits.shape[1]:
+        columns = lax.broadcasted_iota(jnp.int32, logits.shape, 1)
+        logits = jnp.where(columns < valid, logits, -jnp.inf)
+    return logits
+
+
+def _softmax_update(logits, m, denom, dtype, *, dynamic_mask, options):
+    exp2 = _approx_exp2 if options.fast_exp2 else jnp.exp2
+
+    def online():
+        next_m = jnp.maximum(m, jnp.max(logits, axis=1, keepdims=True))
+        safe_m = jnp.where(next_m == -jnp.inf, 0.0, next_m) if dynamic_mask else next_m
+        alpha = jnp.exp2(m - safe_m)
+        p = exp2(logits - safe_m)
+        denom_next = denom * alpha + jnp.sum(p, axis=1, keepdims=True)
+        return next_m, denom_next, p.astype(dtype), alpha, jnp.bool_(True)
+
+    if not options.lazy_rescale:
+        return online()
+
+    # A bounded sum also bounds all individual weights. Nonfinite sums (including
+    # an uninitialized anchor) and outliers replay the tile with a fresh maximum.
+    p = exp2(logits - m)
+    tile_sum = jnp.sum(p, axis=1, keepdims=True)
+    return lax.cond(
+        jnp.all(tile_sum <= 65536.0),
+        lambda: (m, denom + tile_sum, p.astype(dtype), jnp.ones_like(m), jnp.bool_(False)),
+        online,
+    )
+
+
+def _update_numerator(numerator, pv, alpha, rescale, *, lazy_rescale):
+    if lazy_rescale:
+        return lax.cond(rescale, lambda: alpha * numerator + pv, lambda: numerator + pv)
+    return alpha * numerator + pv
+
+
 def _gqa_kernel(
-    q_ref, k_ref, v_ref, mask_ref, out_ref, m_ref, l_ref, o_ref, *, compute_kv, tail, dynamic_mask
+    q_ref, k_ref, v_ref, mask_ref, out_ref, m_ref, l_ref, o_ref, *, compute_kv, tail, dynamic_mask, options
 ):
     kv_step = pl.program_id(2)
     last = kv_step == pl.num_programs(2) - 1
     q = q_ref[...]
-    q_rows = q.shape[0]
     kv_tile = k_ref.shape[0]
-    lane_repeats = compute_kv // _HEAD_DIM
-    precision = lax.Precision.HIGHEST if q.dtype == jnp.float32 else None
 
     @pl.when(kv_step == 0)
     def initialize():
@@ -37,42 +93,21 @@ def _gqa_kernel(
 
     def logits_at(start, valid):
         tile = pl.ds(start, compute_kv)
-        logits = lax.dot_general(
-            q, k_ref[tile, :], _DOT_NT, precision=precision, preferred_element_type=jnp.float32
-        )
-        if dynamic_mask:
-            logits = jnp.where(mask_ref[:, tile] != 0, logits, -jnp.inf)
-        elif valid is not None and start + compute_kv > valid:
-            k_index = lax.broadcasted_iota(jnp.int32, logits.shape, 1)
-            logits = jnp.where(k_index < valid - start, logits, -jnp.inf)
-        return logits
-
-    def prepare(logits, m, denom):
-        tile_max = jnp.max(logits, axis=1, keepdims=True)
-        next_m = jnp.maximum(m, jnp.broadcast_to(tile_max, (q_rows, _HEAD_DIM)))
-        softmax_max = next_m
-        if dynamic_mask:
-            # Before the first valid key, both running sums are zero.
-            softmax_max = jnp.where(next_m == -jnp.inf, 0.0, next_m)
-        alpha = jnp.exp2(m - softmax_max)
-        p = jnp.exp2(logits - jnp.tile(softmax_max, (1, lane_repeats)))
-        tile_sum = jnp.sum(p, axis=1, keepdims=True)
-        next_denom = denom * alpha + jnp.broadcast_to(tile_sum, (q_rows, _HEAD_DIM))
-        return next_m, next_denom, p.astype(v_ref.dtype), alpha
+        mask = mask_ref[:, tile] if dynamic_mask else None
+        return _attention_logits(q, k_ref[tile, :], mask, None if valid is None else valid - start)
 
     def project(p, start):
         # V arrives as [D, KV]. Both dot operands contract along their minor axis.
-        return lax.dot_general(
-            p,
-            v_ref[:, pl.ds(start, compute_kv)],
-            _DOT_NT,
-            precision=precision,
-            preferred_element_type=jnp.float32,
-        )
+        return _dot(p, v_ref[:, pl.ds(start, compute_kv)])
+
+    def prepare(logits, m, denom):
+        return _softmax_update(logits, m, denom, v_ref.dtype, dynamic_mask=dynamic_mask, options=options)
+
+    update = partial(_update_numerator, lazy_rescale=options.lazy_rescale)
 
     def accumulate(valid):
         n_subtiles = kv_tile // compute_kv if valid is None else (valid + compute_kv - 1) // compute_kv
-        m, denom, p, alpha = prepare(logits_at(0, valid), m_ref[...], l_ref[...])
+        m, denom, p, alpha, rescale = prepare(logits_at(0, valid), m_ref[...], l_ref[...])
         numerator = o_ref[...]
         for subtile in range(1, n_subtiles):
             start = subtile * compute_kv
@@ -80,11 +115,11 @@ def _gqa_kernel(
             # matmuls are independent of the next vector update until it consumes QK.
             logits = logits_at(start, valid)
             pv = project(p, start - compute_kv)
-            m, denom, p, next_alpha = prepare(logits, m, denom)
-            numerator = alpha * numerator + pv
-            alpha = next_alpha
+            m, denom, p, next_alpha, next_rescale = prepare(logits, m, denom)
+            numerator = update(numerator, pv, alpha, rescale)
+            alpha, rescale = next_alpha, next_rescale
         pv = project(p, (n_subtiles - 1) * compute_kv)
-        return m, denom, alpha * numerator + pv
+        return m, denom, update(numerator, pv, alpha, rescale)
 
     if tail:
         m, denom, numerator = lax.cond(last, lambda: accumulate(tail), lambda: accumulate(None))
@@ -103,6 +138,91 @@ def _gqa_kernel(
         o_ref[...] = numerator
 
 
+def _continuous_kernel(
+    q_ref, k_hbm, v_hbm, mask_hbm, out_ref, k_buffer, v_buffer, k_sem, v_sem,
+    mask_buffer=None, mask_sem=None, *, kv_heads, block_kv, compute_kv, tail, options,
+):
+    """Double-buffer KV pages and carry the last pending PV across each page boundary."""
+    head = pl.program_id(0)
+    pages = k_hbm.shape[1] // block_kv
+    q = q_ref[...]
+    dynamic_mask = mask_hbm is not None
+    subtile_count = block_kv // compute_kv
+
+    def copies(page, slot):
+        region = pl.ds(page * block_kv, block_kv)
+        transfers = [
+            pltpu.make_async_copy(k_hbm.at[head, region, :], k_buffer.at[slot], k_sem),
+            pltpu.make_async_copy(v_hbm.at[head, :, region], v_buffer.at[slot], v_sem),
+        ]
+        if dynamic_mask:
+            batch = lax.div(head, jnp.int32(kv_heads)) if mask_hbm.shape[0] > 1 else 0
+            transfers.append(
+                pltpu.make_async_copy(mask_hbm.at[batch, :, region], mask_buffer.at[slot], mask_sem)
+            )
+        return transfers
+
+    def logits_at(slot, subtile, valid):
+        tile = pl.ds(subtile * compute_kv, compute_kv)
+        mask = mask_buffer[slot, :, tile] if dynamic_mask else None
+        return _attention_logits(q, k_buffer[slot, tile, :], mask, valid)
+
+    def project(p, slot, subtile):
+        return _dot(p, v_buffer[slot, :, pl.ds(subtile * compute_kv, compute_kv)])
+
+    def prepare(logits, m, denom):
+        return _softmax_update(logits, m, denom, v_buffer.dtype, dynamic_mask=dynamic_mask, options=options)
+
+    update = partial(_update_numerator, lazy_rescale=options.lazy_rescale)
+
+    def advance(state, slot, subtile, next_slot, next_subtile, next_valid, transfers=()):
+        m, denom, numerator, p, alpha, rescale = state
+        pv = project(p, slot, subtile)
+        for transfer in transfers:
+            transfer.wait()
+        logits = logits_at(next_slot, next_subtile, next_valid)
+        m, denom, next_p, next_alpha, next_rescale = prepare(logits, m, denom)
+        return m, denom, update(numerator, pv, alpha, rescale), next_p, next_alpha, next_rescale
+
+    first_transfers = copies(0, 0)
+    for transfer in first_transfers:
+        transfer.start()
+    for transfer in first_transfers:
+        transfer.wait()
+    low = jnp.full((q.shape[0], 1), -jnp.inf, dtype=jnp.float32)
+    zero = jnp.zeros_like(low)
+    m, denom, p, alpha, rescale = prepare(logits_at(0, 0, tail if pages == 1 and tail else None), low, zero)
+    state = (m, denom, jnp.zeros(q.shape, dtype=jnp.float32), p, alpha, rescale)
+
+    def process_page(page, state):
+        slot = page % 2
+        next_slot = 1 - slot
+        transfers = copies(page + 1, next_slot)
+        for transfer in transfers:
+            transfer.start()
+        for sub in range(1, subtile_count):
+            state = advance(state, slot, sub - 1, slot, sub, None)
+        # When the final page starts with a partial tile, mask it before
+        # carrying that tile's probabilities into the next iteration.
+        if tail and tail < compute_kv:
+            return lax.cond(
+                page == pages - 2,
+                lambda: advance(state, slot, subtile_count - 1, next_slot, 0, tail, transfers),
+                lambda: advance(state, slot, subtile_count - 1, next_slot, 0, None, transfers),
+            )
+        return advance(state, slot, subtile_count - 1, next_slot, 0, None, transfers)
+
+    state = lax.fori_loop(0, pages - 1, process_page, state)
+    slot = (pages - 1) % 2
+    final_subtiles = (tail + compute_kv - 1) // compute_kv if tail else subtile_count
+    for sub in range(1, final_subtiles):
+        state = advance(state, slot, sub - 1, slot, sub, tail - sub * compute_kv if tail else None)
+    _, denom, numerator, p, alpha, rescale = state
+    numerator = update(numerator, project(p, slot, final_subtiles - 1), alpha, rescale)
+    divisor = jnp.where(denom > 0, denom, 1.0) if dynamic_mask else denom
+    out_ref[...] = (numerator / divisor).astype(out_ref.dtype)
+
+
 def pallas_gqa_attention(
     q: jax.Array,
     k: jax.Array,
@@ -114,11 +234,19 @@ def pallas_gqa_attention(
     block_kv_compute: int,
     static_valid_len: int | None = None,
     interpret: bool = False,
+    options: PallasGqaOptions = PallasGqaOptions(),
+    grouped_q: bool = False,
 ) -> jax.Array:
-    """Return [B, S, Hq*D] from base-2 prescaled Q and unscaled K/V, all [B, H, S, D]."""
-    batch, q_heads, seq_len, head_dim = q.shape
+    """Return BSH from base-2 prescaled Q and BHSD K/V. Grouped Q is B, Hkv, S, G, D."""
     kv_heads = k.shape[1]
-    if head_dim != _HEAD_DIM or q_heads != _GROUP_SIZE * kv_heads:
+    if grouped_q:
+        batch, q_groups, seq_len, group_size, head_dim = q.shape
+        q_heads = q_groups * group_size
+        layout_valid = q_groups == kv_heads and group_size == _GROUP_SIZE
+    else:
+        batch, q_heads, seq_len, head_dim = q.shape
+        layout_valid = q_heads == _GROUP_SIZE * kv_heads
+    if head_dim != _HEAD_DIM or not layout_valid:
         raise ValueError("pallas_gqa requires head_dim=128 and four query heads per KV head.")
 
     # block_q is in tokens per head. Four aligned query tiles share each K/V DMA.
@@ -145,7 +273,8 @@ def pallas_gqa_attention(
     kv_padded = roundup(valid_len, block_kv)
     flat_heads = batch * kv_heads
 
-    q = q.reshape(batch, kv_heads, _GROUP_SIZE, seq_len, head_dim).transpose(0, 1, 3, 2, 4)
+    if not grouped_q:
+        q = q.reshape(batch, kv_heads, _GROUP_SIZE, seq_len, head_dim).transpose(0, 1, 3, 2, 4)
     q = q.reshape(flat_heads, seq_len * _GROUP_SIZE, head_dim)
     q = jnp.pad(q, ((0, 0), (0, (q_padded - seq_len) * _GROUP_SIZE), (0, 0)))
     k = k[:, :, :valid_len, :].reshape(flat_heads, valid_len, head_dim)
@@ -162,24 +291,52 @@ def pallas_gqa_attention(
             (None, 1, block_kv), lambda head, _, j: (head // kv_heads if masks_per_batch else 0, 0, j)
         )
 
-    q_spec = pl.BlockSpec((None, q_rows, head_dim), lambda head, i, _: (head, i, 0))
-    k_spec = pl.BlockSpec((None, block_kv, head_dim), lambda head, _, j: (head, j, 0))
-    v_spec = pl.BlockSpec((None, head_dim, block_kv), lambda head, _, j: (head, 0, j))
-    stats = pltpu.VMEM((q_rows, head_dim), jnp.float32)
+    q_spec = pl.BlockSpec((None, q_rows, head_dim), lambda head, i, *unused: (head, i, 0))
+    grid = (flat_heads, q_padded // block_q)
+    tail = 0 if dynamic_mask else valid_len % block_kv
+    if options.continuous_kv:
+        hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+        kernel = partial(
+            _continuous_kernel, kv_heads=kv_heads, block_kv=block_kv, compute_kv=block_kv_compute,
+            tail=tail, options=options,
+        )
+        in_specs = (q_spec, hbm, hbm, hbm if dynamic_mask else None)
+        scratch = (
+            pltpu.VMEM((2, block_kv, head_dim), k.dtype),
+            pltpu.VMEM((2, head_dim, block_kv), v.dtype),
+            pltpu.SemaphoreType.DMA,
+            pltpu.SemaphoreType.DMA,
+        )
+        if dynamic_mask:
+            scratch += (pltpu.VMEM((2, 1, block_kv), mask.dtype), pltpu.SemaphoreType.DMA)
+        semantics = ("parallel", "parallel")
+        if interpret is True:
+            interpret = pltpu.InterpretParams(detect_races=True)
+    else:
+        kernel = partial(
+            _gqa_kernel, compute_kv=block_kv_compute, tail=tail, dynamic_mask=dynamic_mask, options=options
+        )
+        in_specs = (
+            q_spec,
+            pl.BlockSpec((None, block_kv, head_dim), lambda head, _, j: (head, j, 0)),
+            pl.BlockSpec((None, head_dim, block_kv), lambda head, _, j: (head, 0, j)),
+            mask_spec,
+        )
+        stats = pltpu.VMEM((q_rows, 1), jnp.float32)
+        scratch = (stats, stats, pltpu.VMEM((q_rows, head_dim), jnp.float32))
+        grid += (kv_padded // block_kv,)
+        semantics = ("parallel", "parallel", "arbitrary")
     out = pl.pallas_call(
-        partial(
-            _gqa_kernel,
-            compute_kv=block_kv_compute,
-            tail=0 if dynamic_mask else valid_len % block_kv,
-            dynamic_mask=dynamic_mask,
-        ),
+        kernel,
         name="krea2_pallas_gqa",
         out_shape=jax.ShapeDtypeStruct(q.shape, v.dtype),
-        grid=(flat_heads, q_padded // block_q, kv_padded // block_kv),
-        in_specs=(q_spec, k_spec, v_spec, mask_spec),
+        grid=grid,
+        in_specs=in_specs,
         out_specs=q_spec,
-        scratch_shapes=(stats, stats, stats),
-        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel", "arbitrary")),
+        scratch_shapes=scratch,
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=semantics, vmem_limit_bytes=options.vmem_limit_bytes
+        ),
         interpret=interpret,
     )(q, k, v, mask)
 

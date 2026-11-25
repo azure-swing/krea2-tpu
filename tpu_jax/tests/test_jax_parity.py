@@ -520,6 +520,33 @@ class TestRunnerAndSplashHelpers(unittest.TestCase):
             with Image.open(saved[-1]) as grid_img:
                 self.assertEqual(grid_img.size, (96, 64))
 
+    def test_pallas_benchmark_defaults_and_optimization_flags(self):
+        from tpu_jax.run_jax import (
+            _benchmark_batch_sizes,
+            _benchmark_tile_configs,
+            _configure_pallas_vmem,
+            _pallas_options,
+            _requested_attn_impls,
+            build_parser,
+        )
+
+        parser = build_parser()
+        args = parser.parse_args(["--attn-impl", "pallas_gqa", "--pallas-gqa-optimize"])
+        impls = _requested_attn_impls(args)
+        self.assertEqual(impls, ["pallas_gqa"])
+        self.assertEqual(_benchmark_batch_sizes(args, impls), [1])
+        self.assertEqual(_benchmark_tile_configs(args, impls[0], 848, 1200), [(256, 2048, 512)])
+        self.assertEqual(_benchmark_tile_configs(args, impls[0], 1696, 2400), [(256, 2048, 1024)])
+        opts = _pallas_options(args)
+        self.assertTrue(opts.fast_exp2 and opts.continuous_kv and opts.lazy_rescale)
+        self.assertEqual(opts.vmem_limit_bytes, 48 * 1024**2)
+        with patch.dict(os.environ, {"LIBTPU_INIT_ARGS": "--other --xla_tpu_scoped_vmem_limit_kib=32768"}):
+            _configure_pallas_vmem(opts)
+            self.assertEqual(os.environ["LIBTPU_INIT_ARGS"], "--other --xla_tpu_scoped_vmem_limit_kib=65536")
+        with patch.dict(os.environ, {"LIBTPU_INIT_ARGS": "--xla_tpu_scoped_vmem_limit_kib=98304"}):
+            _configure_pallas_vmem(opts)
+            self.assertEqual(os.environ["LIBTPU_INIT_ARGS"], "--xla_tpu_scoped_vmem_limit_kib=98304")
+
     @unittest.skipUnless(HAS_JAX, "JAX is not installed in this environment")
     def test_splash_helpers_and_static_mask_builder(self):
         import time

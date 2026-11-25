@@ -8,6 +8,16 @@ from pathlib import Path
 
 
 @dataclass(frozen=True)
+class PallasGqaOptions:
+    """Static compilation options for the grouped TPU attention backend."""
+
+    fast_exp2: bool = False
+    continuous_kv: bool = False
+    lazy_rescale: bool = False
+    vmem_limit_bytes: int | None = None
+
+
+@dataclass(frozen=True)
 class Krea2DiTConfig:
     """Configuration for Krea 2 SingleStreamDiT (12B GQA DiT)."""
 

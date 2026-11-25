@@ -67,6 +67,16 @@ QNorm at load time, and stages adjacent KV subtiles to overlap matrix and
 softmax work. It consumes sequence-minor V and skips empty tiles for static
 prefix masks. BF16 Q scaling and the reordered computation can change rounding.
 
+The v6e defaults are `256×2048×512` at 1K and `256×2048×1024` at 2K.
+Add `--pallas-gqa-optimize` to enable continuous double-buffered KV prefetch,
+checked lazy rescaling, cubic `exp2` for the softmax weights, and a 48 MiB
+kernel VMEM budget together. For individual measurements, use
+`--pallas-gqa-continuous-kv`, `--pallas-gqa-lazy-rescale`,
+`--pallas-gqa-fast-exp2`, or `--pallas-gqa-vmem-mib 48`. The VMEM option
+raises the process-level libtpu limit before backend initialization. The cubic
+approximation keeps exact `exp2` for the accumulator scale and can change
+BF16 results. QNorm and RoPE produce the grouped Q layout directly.
+
 Run the synthetic batch-1 benchmark on v6e without downloading weights.
 
 ```bash
@@ -77,7 +87,8 @@ python3 tpu_jax/run_jax.py --mode microbench --attn-impl pallas_gqa \
 
 python3 tpu_jax/run_jax.py --mode microbench --attn-impl pallas_gqa \
   --width 1696 --height 2400 --batch-sizes 1 \
-  --splash-configs 256x2048x512,128x2048x256,128x2048x512,256x2048x256,512x2048x256,512x2048x512 \
+  --splash-configs 256x2048x1024,256x2048x512,512x2048x1024,1024x2048x512,256x4096x1024 \
+  --pallas-gqa-optimize \
   --splash-mask-modes static
 ```
 
@@ -85,6 +96,8 @@ The first tile size is the number of Q tokens per head. Each grouped Q tile
 has four times as many rows. The sweep times isolated attention with Q scaling
 and the input transpose prepared ahead of time. The full-block timing includes
 projection, QNorm, RoPE, and layout work and uses the first tile configuration.
+The isolated benchmark uses fixed synthetic Q and K. Use `--mode bench` or
+`--mode generate` to time lazy rescaling with model activations.
 
 ## Local Unit & PyTorch-Parity Tests
 
