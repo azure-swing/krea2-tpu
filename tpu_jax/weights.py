@@ -606,6 +606,13 @@ def _build_dit_params(
             perm=rope_perm,
             scale_factor=q_inv_sqrt,
         ),
+        "qnorm_log2": _stream_1d_norm(
+            "attn.norm_q.weight",
+            "attn.qknorm.qnorm.scale",
+            hd,
+            perm=rope_perm,
+            scale_factor=q_inv_sqrt * np.float32(np.log2(np.e)),
+        ),
         "knorm": _stream_1d_norm(
             "attn.norm_k.weight",
             "attn.qknorm.knorm.scale",

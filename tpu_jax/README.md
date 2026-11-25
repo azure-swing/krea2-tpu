@@ -59,8 +59,32 @@ python3 tpu_jax/run_jax.py --mode bench \
   --save-report bench_report.json
 ```
 
+## Grouped Pallas Attention on TPU v6e
+
+Use `--attn-impl pallas_gqa` for SingleStreamDiT inference on v6e. The kernel
+loads a K/V tile once for each four-head query group, folds `log2(e)` into
+QNorm at load time, and stages adjacent KV subtiles to overlap matrix and
+softmax work. It consumes sequence-minor V and skips empty tiles for static
+prefix masks. BF16 Q scaling and the reordered computation can change rounding.
+
+Run the synthetic batch-1 benchmark on v6e without downloading weights.
+
+```bash
+python3 tpu_jax/run_jax.py --mode microbench --attn-impl pallas_gqa \
+  --width 848 --height 1200 --batch-sizes 1 \
+  --splash-configs 1024x1024x512 --splash-mask-modes static
+
+python3 tpu_jax/run_jax.py --mode microbench --attn-impl pallas_gqa \
+  --width 1696 --height 2400 --batch-sizes 1 \
+  --splash-configs 1024x2048x512 --splash-mask-modes static
+```
+
+The first tile size is the number of Q tokens per head. Each grouped Q tile
+has four times as many rows.
+
 ## Local Unit & PyTorch-Parity Tests
 
 ```bash
 python -m unittest tpu_jax/tests/test_jax_parity.py -v
+python -m unittest tpu_jax.tests.test_pallas_gqa_attn -v
 ```

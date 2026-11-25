@@ -26,6 +26,7 @@ import math
 import statistics
 import sys
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,9 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+PREFIX_MASK_ATTN_IMPLS = ("splash", "pallas_gqa")
+TILED_ATTN_IMPLS = (*PREFIX_MASK_ATTN_IMPLS, "flash")
 
 
 def _tpu_peak_bf16_tflops(device_kind: str, num_chips: int = 1) -> float | None:
@@ -609,7 +613,7 @@ def run_generate(args) -> dict[str, Any]:
 
         # Decide static lazy PrefixMask vs dynamic SegmentIds.
         use_static = False
-        if attn_impl == "splash" and compact_text and pos_common_txt is not None:
+        if attn_impl in PREFIX_MASK_ATTN_IMPLS and compact_text and pos_common_txt is not None:
             if args.splash_mask_mode == "static":
                 use_static = True
             elif args.splash_mask_mode == "auto":
@@ -738,7 +742,7 @@ def run_generate(args) -> dict[str, Any]:
 
     stage2_metrics = {
         "attn_impl": attn_impl,
-        "splash_blocks": f"{bq}x{bkv}x{bkvc}" if attn_impl in ("splash", "flash") else None,
+        "splash_blocks": f"{bq}x{bkv}x{bkvc}" if attn_impl in TILED_ATTN_IMPLS else None,
         "splash_mask_mode": "static" if used_static_mask else "segment",
         "compact_text": compact_text,
         "effective_txt_len": used_txt_len,
@@ -956,8 +960,9 @@ def run_bench(args) -> dict[str, Any]:
                 seed=args.seed,
             )
             for attn_impl in attn_impls:
-                cfgs = splash_cfgs if attn_impl in ("splash", "flash") else [(512, 512, 512)]
-                m_modes = mask_modes if attn_impl == "splash" else ["segment"]
+                prefix_mask = attn_impl in PREFIX_MASK_ATTN_IMPLS
+                cfgs = splash_cfgs if attn_impl in TILED_ATTN_IMPLS else [(512, 512, 512)]
+                m_modes = mask_modes if prefix_mask else ["segment"]
                 for bq, bkv, bkvc in cfgs:
                     for m_mode in m_modes:
                         for unroll in scan_unrolls:
@@ -965,7 +970,7 @@ def run_bench(args) -> dict[str, Any]:
                             static_vlen = (img_len + common_valid_txt) if use_static else None
                             case_name = (
                                 f"{width}x{height}_b{batch_size}_{attn_impl}"
-                                + (f"_{bq}x{bkv}x{bkvc}_{m_mode}" if attn_impl == "splash" else "")
+                                + (f"_{bq}x{bkv}x{bkvc}_{m_mode}" if prefix_mask else "")
                                 + (f"_u{unroll}" if unroll > 1 else "")
                             )
                             denoise_fn = make_denoise_fn(
@@ -1008,8 +1013,8 @@ def run_bench(args) -> dict[str, Any]:
                                     "height": height,
                                     "batch_size": batch_size,
                                     "attn_impl": attn_impl,
-                                    "splash_blocks": f"{bq}x{bkv}x{bkvc}" if attn_impl in ("splash", "flash") else None,
-                                    "splash_mask_mode": m_mode if attn_impl == "splash" else None,
+                                    "splash_blocks": f"{bq}x{bkv}x{bkvc}" if attn_impl in TILED_ATTN_IMPLS else None,
+                                    "splash_mask_mode": m_mode if prefix_mask else None,
                                     "scan_unroll": unroll,
                                     "error": err,
                                     "memory_stats": _memory_stats_gib(dev0),
@@ -1033,8 +1038,8 @@ def run_bench(args) -> dict[str, Any]:
                                     "height": height,
                                     "batch_size": batch_size,
                                     "attn_impl": attn_impl,
-                                    "splash_blocks": f"{bq}x{bkv}x{bkvc}" if attn_impl in ("splash", "flash") else None,
-                                    "splash_mask_mode": ("static" if use_static else "segment") if attn_impl == "splash" else None,
+                                    "splash_blocks": f"{bq}x{bkv}x{bkvc}" if attn_impl in TILED_ATTN_IMPLS else None,
+                                    "splash_mask_mode": ("static" if use_static else "segment") if prefix_mask else None,
                                     "compact_text": compact_text,
                                     "effective_txt_len": txt_len,
                                     "scan_unroll": unroll,
@@ -1077,7 +1082,7 @@ def run_microbench(args) -> dict[str, Any]:
     """Synthetic single-block breakdown benchmark (no checkpoint download required!).
 
     Measures isolated millisecond timings & TFLOP/s for every component inside one
-    Krea 2 SingleStreamBlock (4 MXU GEMMs, QKNorm+RoPE, SplashAttention across tile
+    Krea 2 SingleStreamBlock (4 MXU GEMMs, QKNorm+RoPE, attention across tile
     & mask configs, and full 1-block forward) across ``--batch-sizes``.
     """
     import jax
@@ -1085,15 +1090,25 @@ def run_microbench(args) -> dict[str, Any]:
 
     from tpu_jax.config import Krea2DiTConfig
     from tpu_jax.dit import (
+        _LOG2_E,
         _apply_rope,
         _gqa_attention,
         _matmul,
+        _pallas_gqa,
         _rms_norm,
         _single_stream_block_forward,
         _swiglu_op,
     )
     from tpu_jax.scheduler import roundup
     from tpu_jax.weights import release_tpu_pytree
+
+    attn_impls = (
+        [args.attn_impl]
+        if args.attn_impl != "auto"
+        else [x.strip() for x in args.attn_impls.split(",") if x.strip()]
+    )
+    if not attn_impls or any(impl not in PREFIX_MASK_ATTN_IMPLS for impl in attn_impls):
+        raise ValueError("Microbench expects splash or pallas_gqa attention.")
 
     dev0, _mesh, _active_devs = _configure_jax(args)
     device_kind = getattr(dev0, "device_kind", str(dev0))
@@ -1193,56 +1208,60 @@ def run_microbench(args) -> dict[str, Any]:
         ops.append(_rec("qknorm_plus_rope", _time_fn(fn_qkr, q_in, k_in, block["qnorm"], block["knorm"], cos, sin), 0.0))
 
         attn_flops = 4.0 * bs * seq_len * seq_len * d
-        for bq, bkv, bkvc in splash_cfgs:
-            for m_mode in mask_modes:
-                svl = valid_len if m_mode == "static" else None
-                fn_sp = jax.jit(
-                    lambda qq, kk, vv, m, _bq=bq, _bkv=bkv, _bkvc=bkvc, _svl=svl: _gqa_attention(
-                        qq,
-                        kk,
-                        vv,
-                        m,
-                        attn_impl="splash",
-                        splash_block_q=_bq,
-                        splash_block_kv=_bkv,
-                        splash_block_kv_compute=_bkvc,
-                        static_valid_len=_svl,
-                    )
-                )
-                try:
-                    ms_sp = _time_fn(fn_sp, q_in, k_in, v_in, vm)
-                    ops.append(_rec(f"splash_{bq}x{bkv}x{bkvc}_{m_mode}", ms_sp, attn_flops))
-                except Exception as exc:
-                    ops.append({"op": f"splash_{bq}x{bkv}x{bkvc}_{m_mode}", "error": f"{type(exc).__name__}: {exc}"})
+        for impl in attn_impls:
+            if impl == "pallas_gqa":
+                q_log2 = (q_in.astype(jnp.float32) * _LOG2_E).astype(q_in.dtype)
+                qkv = tuple(a.transpose(0, 2, 1, 3) for a in (q_log2, k_in, v_in))
+            else:
+                qkv = q_in, k_in, v_in
+            for bq, bkv, bkvc in splash_cfgs:
+                for m_mode in mask_modes:
+                    svl = valid_len if m_mode == "static" else None
+                    if impl == "pallas_gqa":
+                        attention = partial(
+                            _pallas_gqa, block_q=bq, block_kv=bkv, block_kv_compute=bkvc, static_valid_len=svl
+                        )
+                    else:
+                        attention = partial(
+                            _gqa_attention,
+                            attn_impl=impl,
+                            splash_block_q=bq,
+                            splash_block_kv=bkv,
+                            splash_block_kv_compute=bkvc,
+                            static_valid_len=svl,
+                        )
+                    op = f"{impl}_{bq}x{bkv}x{bkvc}_{m_mode}"
+                    try:
+                        ops.append(_rec(op, _time_fn(jax.jit(attention), *qkv, vm), attn_flops))
+                    except Exception as exc:
+                        ops.append({"op": op, "error": f"{type(exc).__name__}: {exc}"})
 
-        # Full single block with first splash config + static mask
-        bq0, bkv0, bkvc0 = splash_cfgs[0]
-        svl0 = valid_len if ("static" in mask_modes) else None
-        fn_blk = jax.jit(
-            lambda a, blk, tv, c, s, m: _single_stream_block_forward(
-                a,
-                blk,
-                tv,
-                c,
-                s,
-                m,
-                num_heads=hq,
-                num_kv_heads=hkv,
-                head_dim=hd,
-                norm_eps=cfg.norm_eps,
-                attn_impl="splash",
-                splash_block_q=bq0,
-                splash_block_kv=bkv0,
-                splash_block_kv_compute=bkvc0,
-                static_valid_len=svl0,
+            # Full single block with the first tile configuration.
+            bq, bkv, bkvc = splash_cfgs[0]
+            fn_blk = jax.jit(
+                partial(
+                    _single_stream_block_forward,
+                    num_heads=hq,
+                    num_kv_heads=hkv,
+                    head_dim=hd,
+                    norm_eps=cfg.norm_eps,
+                    attn_impl=impl,
+                    splash_block_q=bq,
+                    splash_block_kv=bkv,
+                    splash_block_kv_compute=bkvc,
+                    static_valid_len=valid_len if "static" in mask_modes else None,
+                )
             )
-        )
-        total_blk_flops = (
-            2.0 * bs * seq_len * d * (3 * d + 2 * hkv * hd)
-            + 6.0 * bs * seq_len * d * mlp_d
-            + attn_flops
-        )
-        ops.append(_rec(f"full_block_{bq0}x{bkv0}x{bkvc0}", _time_fn(fn_blk, x, block, tvec, cos, sin, vm), total_blk_flops))
+            total_blk_flops = (
+                2.0 * bs * seq_len * d * (3 * d + 2 * hkv * hd)
+                + 6.0 * bs * seq_len * d * mlp_d
+                + attn_flops
+            )
+            op = f"full_block_{bq}x{bkv}x{bkvc}" if impl == "splash" else f"full_block_{impl}_{bq}x{bkv}x{bkvc}"
+            try:
+                ops.append(_rec(op, _time_fn(fn_blk, x, block, tvec, cos, sin, vm), total_blk_flops))
+            except Exception as exc:
+                ops.append({"op": op, "error": f"{type(exc).__name__}: {exc}"})
 
         entry = {
             "width": args.width,
@@ -1352,7 +1371,7 @@ def run_parity(args) -> dict[str, Any]:
                 splash_block_q=bq,
                 splash_block_kv=bkv,
                 splash_block_kv_compute=bkvc,
-                static_valid_len=static_vlen if _impl == "splash" else None,
+                static_valid_len=static_vlen if _impl in PREFIX_MASK_ATTN_IMPLS else None,
                 scan_unroll=args.scan_unroll,
                 tp_size=tp_size,
             )
@@ -1432,7 +1451,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resident-vae", choices=("auto", "on", "off"), default="auto")
     p.add_argument("--vae-attn-chunk", type=int, default=1024)
     p.add_argument("--load-workers", type=int, default=None, help="Parallel CPU threads for safetensors streaming")
-    p.add_argument("--attn-impl", choices=("auto", "splash", "flash", "xla", "einsum"), default="auto")
+    p.add_argument("--attn-impl", choices=("auto", "splash", "flash", "xla", "einsum", "pallas_gqa"), default="auto")
     p.add_argument("--attn-impls", type=str, default="splash")
     p.add_argument("--splash-tile", type=int, default=None, help="Symmetric Splash tile shorthand (overrides auto)")
     p.add_argument("--splash-block-q", type=int, default=None, help="SplashAttention block_q (default: 1024)")

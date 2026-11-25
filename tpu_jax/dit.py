@@ -41,7 +41,8 @@ from jax import lax
 from tpu_jax.config import Krea2DiTConfig
 from tpu_jax.scheduler import roundup
 
-VALID_ATTN_IMPLS = ("splash", "flash", "xla", "einsum")
+VALID_ATTN_IMPLS = ("splash", "flash", "xla", "einsum", "pallas_gqa")
+_LOG2_E = np.float32(np.log2(np.e))
 
 
 def _rms_norm(x: jnp.ndarray, weight: jnp.ndarray, eps: float = 1e-5) -> jnp.ndarray:
@@ -109,15 +110,18 @@ def compute_rope_cos_sin(
     return jnp.concatenate(cos_parts, axis=-1), jnp.concatenate(sin_parts, axis=-1)
 
 
-def _apply_rope(x: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray) -> jnp.ndarray:
-    """Apply contiguous half-split RoPE to ``x [B, S, H, D]`` (weights pre-permuted ``[even|odd]``)."""
+def _apply_rope(
+    x: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray, *, head_first: bool = False
+) -> jnp.ndarray:
+    """Apply contiguous half-split RoPE to BSHD or BHSD (weights pre-permuted even/odd)."""
     orig_dtype = x.dtype
     half = x.shape[-1] // 2
     x_f32 = x.astype(jnp.float32)
     x0 = x_f32[..., :half]
     x1 = x_f32[..., half:]
-    c = cos[:, :, None, :]
-    s = sin[:, :, None, :]
+    head_axis = 1 if head_first else 2
+    c = jnp.expand_dims(cos, head_axis)
+    s = jnp.expand_dims(sin, head_axis)
     y0 = x0 * c - x1 * s
     y1 = x0 * s + x1 * c
     return jnp.concatenate([y0, y1], axis=-1).astype(orig_dtype)
@@ -479,6 +483,18 @@ def _gqa_attention(
     num_kv_heads = k.shape[2]
     out_dim = num_q_heads * head_dim
 
+    if attn_impl == "pallas_gqa":
+        return _pallas_gqa(
+            (q.astype(jnp.float32) * _LOG2_E).astype(q.dtype).transpose(0, 2, 1, 3),
+            k.transpose(0, 2, 1, 3),
+            v.transpose(0, 2, 1, 3),
+            valid_mask,
+            splash_block_q,
+            splash_block_kv,
+            splash_block_kv_compute,
+            static_valid_len,
+        )
+
     if attn_impl == "splash":
         out = _splash_attention(
             q,
@@ -523,6 +539,15 @@ def _gqa_attention(
     raise ValueError(f"Unknown attn_impl={attn_impl!r}; expected one of {VALID_ATTN_IMPLS}.")
 
 
+def _pallas_gqa(q, k, v, valid_mask, block_q, block_kv, block_kv_compute, static_valid_len):
+    from tpu_jax.pallas_gqa_attn import pallas_gqa_attention
+
+    bq, bkv, bkvc, _, _ = _resolve_splash_block_sizes(q.shape[2], block_q, block_kv, block_kv_compute)
+    return pallas_gqa_attention(
+        q, k, v, valid_mask, block_q=bq, block_kv=bkv, block_kv_compute=bkvc, static_valid_len=static_valid_len
+    )
+
+
 def _attention_block_op(
     y: jnp.ndarray,
     block: dict[str, jnp.ndarray],
@@ -561,23 +586,35 @@ def _attention_block_op(
         v = qkvg_s[..., q_s + kv_s : q_s + 2 * kv_s].reshape(batch, seq_len, num_kv_heads, head_dim)
         gate = qkvg_s[..., q_s + 2 * kv_s :].reshape(batch, seq_len, num_heads * head_dim)
 
-    q = _rms_norm(q, block["qnorm"], norm_eps)
+    grouped = attn_impl == "pallas_gqa"
+    qnorm = block["qnorm"]
+    if grouped:
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+        qnorm = block["qnorm_log2"] if "qnorm_log2" in block else qnorm * _LOG2_E
+    q = _rms_norm(q, qnorm, norm_eps)
     k = _rms_norm(k, block["knorm"], norm_eps)
     if cos is not None and sin is not None:
-        q = _apply_rope(q, cos, sin)
-        k = _apply_rope(k, cos, sin)
+        q = _apply_rope(q, cos, sin, head_first=grouped)
+        k = _apply_rope(k, cos, sin, head_first=grouped)
 
-    attn_out = _gqa_attention(
-        q,
-        k,
-        v,
-        valid_mask,
-        attn_impl=attn_impl,
-        splash_block_q=splash_block_q,
-        splash_block_kv=splash_block_kv,
-        splash_block_kv_compute=splash_block_kv_compute,
-        static_valid_len=static_valid_len,
-    )
+    if grouped:
+        attn_out = _pallas_gqa(
+            q, k, v, valid_mask, splash_block_q, splash_block_kv, splash_block_kv_compute, static_valid_len
+        )
+    else:
+        attn_out = _gqa_attention(
+            q,
+            k,
+            v,
+            valid_mask,
+            attn_impl=attn_impl,
+            splash_block_q=splash_block_q,
+            splash_block_kv=splash_block_kv,
+            splash_block_kv_compute=splash_block_kv_compute,
+            static_valid_len=static_valid_len,
+        )
     gated = attn_out * jax.nn.sigmoid(gate)
     return _matmul(gated, block["wo_w"], block.get("wo_s"))
 
@@ -606,7 +643,7 @@ def _text_fusion_block_forward(
     attn_impl: str,
 ) -> jnp.ndarray:
     # TextFusion runs once per prompt on tiny S (12 or <=512); xla/einsum avoids Pallas pad overhead.
-    eff_impl = "xla" if attn_impl in ("splash", "flash") else attn_impl
+    eff_impl = "xla" if attn_impl in ("splash", "flash", "pallas_gqa") else attn_impl
     h = _rms_norm(x, block["prenorm"], norm_eps)
     x = x + _attention_block_op(
         h,

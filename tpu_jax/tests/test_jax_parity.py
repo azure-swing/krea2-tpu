@@ -140,18 +140,18 @@ def _native_to_diffusers_state_dict(sd: dict[str, np.ndarray]) -> dict[str, np.n
 
 @unittest.skipUnless(HAS_JAX, "JAX is not installed in this environment")
 class TestJaxDiTParity(unittest.TestCase):
-    def _make_tiny_models(self):
+    def _make_tiny_models(self, *, features=128, heads=8):
         import jax.numpy as jnp
         import mmdit
         from tpu_jax.weights import build_dit_params_from_state_dict
 
         torch.manual_seed(42)
         pt_cfg = mmdit.SingleMMDiTConfig(
-            features=128,
+            features=features,
             tdim=32,
             txtdim=64,
-            heads=8,
-            kvheads=2,
+            heads=heads,
+            kvheads=heads // 4,
             multiplier=2,
             layers=3,
             patch=2,
@@ -163,11 +163,11 @@ class TestJaxDiTParity(unittest.TestCase):
             txtkvheads=4,
         )
         jax_cfg = Krea2DiTConfig(
-            features=128,
+            features=features,
             tdim=32,
             txtdim=64,
-            heads=8,
-            kvheads=2,
+            heads=heads,
+            kvheads=heads // 4,
             multiplier=2,
             layers=3,
             patch=2,
@@ -254,6 +254,44 @@ class TestJaxDiTParity(unittest.TestCase):
                     atol=2e-4,
                     err_msg=f"Mismatch for format={label}, attn_impl={impl}",
                 )
+
+    def test_pallas_gqa_dit_forward_matches_pytorch(self):
+        from functools import partial
+
+        import jax
+        import jax.numpy as jnp
+        import mmdit
+        import sampling
+        from tpu_jax.dit import dit_forward_precomputed, patchify_latents, prepare_text_conditioning
+        from tpu_jax.pallas_gqa_attn import pallas_gqa_attention
+
+        pt_model, cfg, native, diffusers = self._make_tiny_models(features=512, heads=4)
+        torch.manual_seed(7)
+        latents = torch.randn(1, 4, 8, 8)
+        context = torch.randn(1, 8, cfg.txtlayers, cfg.txtdim)
+        mask = torch.tensor([[1, 1, 0, 0, 1, 1, 1, 0]], dtype=torch.bool)
+        t = torch.tensor([0.75])
+        tok_pt, pos_pt, mask_pt = sampling.prepare(latents, mask.shape[1], cfg.patch, mask)
+        with torch.no_grad(), patch.object(mmdit, "sdpa_kernel", lambda *_a, **_kw: nullcontext()):
+            expected = pt_model(tok_pt, context, t, pos_pt, mask_pt).numpy()
+
+        tok = patchify_latents(jnp.asarray(latents.numpy()), patch=cfg.patch)
+        t_j = jnp.asarray(t.numpy())
+        context_j = jnp.asarray(context.numpy())
+        mask_j = jnp.asarray(mask.numpy())
+        with patch(
+            "tpu_jax.pallas_gqa_attn.pallas_gqa_attention",
+            partial(pallas_gqa_attention, interpret=jax.default_backend() != "tpu"),
+        ):
+            for params in (native, diffusers):
+                text, cos, sin, valid, pad_len = prepare_text_conditioning(
+                    params, cfg, context_j, mask_j, latent_h=8, latent_w=8, attn_impl="pallas_gqa",
+                )
+                got = dit_forward_precomputed(
+                    params, cfg, tok, t_j, text, cos, sin, valid, pad_len=pad_len,
+                    attn_impl="pallas_gqa", splash_block_q=128, splash_block_kv=256, splash_block_kv_compute=128,
+                )
+                np.testing.assert_allclose(np.asarray(got), expected, rtol=1e-4, atol=2e-4)
 
     def test_full_euler_denoise_loop_turbo_and_cfg(self):
         import jax.numpy as jnp
