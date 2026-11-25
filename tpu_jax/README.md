@@ -72,15 +72,19 @@ Run the synthetic batch-1 benchmark on v6e without downloading weights.
 ```bash
 python3 tpu_jax/run_jax.py --mode microbench --attn-impl pallas_gqa \
   --width 848 --height 1200 --batch-sizes 1 \
-  --splash-configs 1024x1024x512 --splash-mask-modes static
+  --splash-configs 256x1024x512,128x1024x256,128x1024x512,256x1024x256,512x1024x256,512x1024x512 \
+  --splash-mask-modes static
 
 python3 tpu_jax/run_jax.py --mode microbench --attn-impl pallas_gqa \
   --width 1696 --height 2400 --batch-sizes 1 \
-  --splash-configs 1024x2048x512 --splash-mask-modes static
+  --splash-configs 256x2048x512,128x2048x256,128x2048x512,256x2048x256,512x2048x256,512x2048x512 \
+  --splash-mask-modes static
 ```
 
 The first tile size is the number of Q tokens per head. Each grouped Q tile
-has four times as many rows.
+has four times as many rows. The sweep times isolated attention with Q scaling
+and the input transpose prepared ahead of time. The full-block timing includes
+projection, QNorm, RoPE, and layout work and uses the first tile configuration.
 
 ## Local Unit & PyTorch-Parity Tests
 

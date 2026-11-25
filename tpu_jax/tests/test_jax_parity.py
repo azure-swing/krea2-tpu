@@ -140,7 +140,7 @@ def _native_to_diffusers_state_dict(sd: dict[str, np.ndarray]) -> dict[str, np.n
 
 @unittest.skipUnless(HAS_JAX, "JAX is not installed in this environment")
 class TestJaxDiTParity(unittest.TestCase):
-    def _make_tiny_models(self, *, features=128, heads=8):
+    def _make_tiny_models(self, *, features=128, heads=8, consume=False):
         import jax.numpy as jnp
         import mmdit
         from tpu_jax.weights import build_dit_params_from_state_dict
@@ -186,9 +186,13 @@ class TestJaxDiTParity(unittest.TestCase):
                     p.normal_(mean=0.0, std=0.2)
 
         raw_sd = {k: v.detach().cpu().float().numpy() for k, v in pt_model.state_dict().items()}
-        jax_params_native = build_dit_params_from_state_dict(raw_sd, jax_cfg, dtype=jnp.float32)
         diffusers_sd = _native_to_diffusers_state_dict(raw_sd)
-        jax_params_diffusers = build_dit_params_from_state_dict(diffusers_sd, jax_cfg, dtype=jnp.float32)
+        jax_params_native = build_dit_params_from_state_dict(
+            raw_sd, jax_cfg, dtype=jnp.float32, consume=consume
+        )
+        jax_params_diffusers = build_dit_params_from_state_dict(
+            diffusers_sd, jax_cfg, dtype=jnp.float32, consume=consume
+        )
         return pt_model, jax_cfg, jax_params_native, jax_params_diffusers
 
     def test_single_forward_matches_pytorch_native_and_diffusers(self):
@@ -255,7 +259,7 @@ class TestJaxDiTParity(unittest.TestCase):
                     err_msg=f"Mismatch for format={label}, attn_impl={impl}",
                 )
 
-    def test_pallas_gqa_dit_forward_matches_pytorch(self):
+    def test_pallas_gqa_dit_forward_with_consumed_weights_matches_pytorch(self):
         from functools import partial
 
         import jax
@@ -265,7 +269,7 @@ class TestJaxDiTParity(unittest.TestCase):
         from tpu_jax.dit import dit_forward_precomputed, patchify_latents, prepare_text_conditioning
         from tpu_jax.pallas_gqa_attn import pallas_gqa_attention
 
-        pt_model, cfg, native, diffusers = self._make_tiny_models(features=512, heads=4)
+        pt_model, cfg, native, diffusers = self._make_tiny_models(features=512, heads=4, consume=True)
         torch.manual_seed(7)
         latents = torch.randn(1, 4, 8, 8)
         context = torch.randn(1, 8, cfg.txtlayers, cfg.txtdim)
@@ -284,6 +288,11 @@ class TestJaxDiTParity(unittest.TestCase):
             partial(pallas_gqa_attention, interpret=jax.default_backend() != "tpu"),
         ):
             for params in (native, diffusers):
+                block_weights = params["blocks"]
+                np.testing.assert_array_equal(
+                    np.asarray(block_weights["qnorm_log2"]),
+                    np.asarray(block_weights["qnorm"]) * np.float32(np.log2(np.e)),
+                )
                 text, cos, sin, valid, pad_len = prepare_text_conditioning(
                     params, cfg, context_j, mask_j, latent_h=8, latent_w=8, attn_impl="pallas_gqa",
                 )

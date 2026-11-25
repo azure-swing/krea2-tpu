@@ -90,23 +90,67 @@ class TestPallasGqaAttention(unittest.TestCase):
             actual = jax.jit(partial(attention, attn_impl="pallas_gqa"))(*args)
         np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-4, atol=1e-4)
 
+    def test_dynamic_mask_is_shared_or_per_batch_item(self):
+        seq_len = 257
+        keys = jax.random.split(jax.random.key(19), 3)
+        q = jax.random.normal(keys[0], (2, seq_len, 8, 128)) / np.sqrt(128)
+        k, v = (jax.random.normal(key, (2, seq_len, 2, 128)) for key in keys[1:])
+        positions = jnp.arange(seq_len)[None, :]
+        mask = (positions + jnp.arange(2)[:, None]) % 3 != 0
+        q_log2 = q * np.float32(np.log2(np.e))
+        qkv = tuple(x.transpose(0, 2, 1, 3) for x in (q_log2, k, v))
+        pallas = jax.jit(
+            partial(
+                pallas_gqa_attention,
+                block_q=128,
+                block_kv=256,
+                block_kv_compute=128,
+                interpret=jax.default_backend() != "tpu",
+            )
+        )
+        for valid in (mask, mask[:1]):
+            with self.subTest(mask_rows=valid.shape[0]):
+                got = pallas(*qkv, valid)
+                expected = _gqa_attention(q, k, v, valid, attn_impl="einsum")
+                np.testing.assert_allclose(np.asarray(got), np.asarray(expected), rtol=1e-4, atol=1e-4)
+
+    def test_rejects_invalid_tile_sizes(self):
+        q = jax.ShapeDtypeStruct((1, 4, 383, 128), jnp.float32)
+        kv = jax.ShapeDtypeStruct((1, 1, 383, 128), jnp.float32)
+        fn = jax.jit(
+            pallas_gqa_attention,
+            static_argnames=("block_q", "block_kv", "block_kv_compute"),
+        )
+        for bq, bkv, bkvc, invalid in (
+            (0, 256, 128, "block_q"),
+            (127, 256, 128, "block_q"),
+            (128, 0, 128, "block_kv"),
+            (128, 256, 0, "block_kv"),
+            (128, 256, 64, "block_kv"),
+            (128, 384, 256, "block_kv"),
+        ):
+            with self.subTest(tile=(bq, bkv, bkvc)), self.assertRaisesRegex(ValueError, invalid):
+                fn.trace(q, kv, kv, None, block_q=bq, block_kv=bkv, block_kv_compute=bkvc)
+
     def test_lowering_for_v6e_at_issue_resolutions(self):
         mesh = AbstractMesh((), (), abstract_device=AbstractDevice("TPU v6 lite", 1, "tpu"))
         for seq_len, block_kv in ((4096, 1024), (16128, 2048)):
-            with self.subTest(seq_len=seq_len), use_abstract_mesh(mesh):
-                q = jax.ShapeDtypeStruct((1, 48, seq_len, 128), jnp.bfloat16)
-                kv = jax.ShapeDtypeStruct((1, 12, seq_len, 128), jnp.bfloat16)
-                fn = jax.jit(
-                    partial(
-                        pallas_gqa_attention,
-                        block_q=1024,
-                        block_kv=block_kv,
-                        block_kv_compute=512,
-                        static_valid_len=seq_len - 17,
+            for batch, mask_rows in ((1, 0), (1, 1), (2, 1), (2, 2)):
+                with self.subTest(seq_len=seq_len, batch=batch, mask_rows=mask_rows), use_abstract_mesh(mesh):
+                    q = jax.ShapeDtypeStruct((batch, 48, seq_len, 128), jnp.bfloat16)
+                    kv = jax.ShapeDtypeStruct((batch, 12, seq_len, 128), jnp.bfloat16)
+                    mask = jax.ShapeDtypeStruct((mask_rows, seq_len), jnp.bool_) if mask_rows else None
+                    fn = jax.jit(
+                        partial(
+                            pallas_gqa_attention,
+                            block_q=1024,
+                            block_kv=block_kv,
+                            block_kv_compute=512,
+                            static_valid_len=None if mask_rows else seq_len - 17,
+                        )
                     )
-                )
-                lowered = fn.trace(q, kv, kv, None).lower(lowering_platforms=("tpu",))
-                self.assertIn("stablehlo.custom_call", lowered.as_text())
+                    lowered = fn.trace(q, kv, kv, mask).lower(lowering_platforms=("tpu",))
+                    self.assertIn("stablehlo.custom_call", lowered.as_text())
 
 
 if __name__ == "__main__":

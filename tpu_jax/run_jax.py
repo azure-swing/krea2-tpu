@@ -1132,10 +1132,12 @@ def run_microbench(args) -> dict[str, Any]:
 
     key = jax.random.PRNGKey(0)
     k1, k2, k3, k4 = jax.random.split(key, 4)
+    qnorm = np.full((hd,), 1.0 / math.sqrt(hd), dtype=np.float32)
     block = {
         "prenorm": jax.device_put(jnp.ones((d,), dtype=jnp.float32), dev0),
         "postnorm": jax.device_put(jnp.ones((d,), dtype=jnp.float32), dev0),
-        "qnorm": jax.device_put(jnp.full((hd,), 1.0 / math.sqrt(hd), dtype=jnp.float32), dev0),
+        "qnorm": jax.device_put(qnorm, dev0),
+        "qnorm_log2": jax.device_put(qnorm * _LOG2_E, dev0),
         "knorm": jax.device_put(jnp.ones((hd,), dtype=jnp.float32), dev0),
         "mod_lin": jax.device_put(jnp.zeros((6 * d,), dtype=dtype), dev0),
         "qkvgate_w": jax.device_put(jax.random.normal(k1, (d, qkvg_out), dtype=dtype) * 0.02, dev0),

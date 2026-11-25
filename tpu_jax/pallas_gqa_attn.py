@@ -50,10 +50,12 @@ def _gqa_kernel(
     def prepare(logits, m, denom):
         tile_max = jnp.max(logits, axis=1, keepdims=True)
         next_m = jnp.maximum(m, jnp.broadcast_to(tile_max, (q_rows, _HEAD_DIM)))
-        # A dynamic mask may leave a row empty across several subtiles.
-        safe_m = jnp.where(next_m == -jnp.inf, 0.0, next_m)
-        alpha = jnp.where(m == next_m, 1.0, jnp.exp2(m - safe_m))
-        p = jnp.exp2(logits - jnp.tile(safe_m, (1, lane_repeats)))
+        softmax_max = next_m
+        if dynamic_mask:
+            # Before the first valid key, both running sums are zero.
+            softmax_max = jnp.where(next_m == -jnp.inf, 0.0, next_m)
+        alpha = jnp.exp2(m - softmax_max)
+        p = jnp.exp2(logits - jnp.tile(softmax_max, (1, lane_repeats)))
         tile_sum = jnp.sum(p, axis=1, keepdims=True)
         next_denom = denom * alpha + jnp.broadcast_to(tile_sum, (q_rows, _HEAD_DIM))
         return next_m, next_denom, p.astype(v_ref.dtype), alpha
@@ -91,7 +93,8 @@ def _gqa_kernel(
 
     @pl.when(last)
     def finish():
-        out_ref[...] = (numerator / jnp.where(denom > 0, denom, 1.0)).astype(out_ref.dtype)
+        divisor = jnp.where(denom > 0, denom, 1.0) if dynamic_mask else denom
+        out_ref[...] = (numerator / divisor).astype(out_ref.dtype)
 
     @pl.when(~last)
     def save():
@@ -120,6 +123,18 @@ def pallas_gqa_attention(
 
     # block_q is in tokens per head. Four aligned query tiles share each K/V DMA.
     q_rows = block_q * _GROUP_SIZE
+    if q_rows <= 0 or q_rows % 8:
+        raise ValueError("block_q must be positive and produce a grouped Q tile divisible by 8 rows.")
+    if (
+        block_kv <= 0
+        or block_kv_compute <= 0
+        or block_kv_compute % _HEAD_DIM
+        or block_kv % block_kv_compute
+    ):
+        raise ValueError(
+            "block_kv and block_kv_compute must be positive multiples of 128, "
+            "and block_kv must be divisible by block_kv_compute."
+        )
     q_padded = roundup(seq_len, block_q)
     valid_len = seq_len if static_valid_len is None else static_valid_len
     if not 0 <= valid_len <= seq_len:
