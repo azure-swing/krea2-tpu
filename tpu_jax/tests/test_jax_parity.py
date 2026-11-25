@@ -454,8 +454,8 @@ class TestRunnerAndSplashHelpers(unittest.TestCase):
         args_auto = SimpleNamespace(
             splash_tile=None, splash_block_q=None, splash_block_kv=None, splash_block_kv_compute=None
         )
-        self.assertEqual(_resolve_splash_config(args_auto, width=1024, height=1024), (512, 1024, 512))
-        self.assertEqual(_resolve_splash_config(args_auto, width=2048, height=2048), (1024, 1024, 512))
+        self.assertEqual(_resolve_splash_config(args_auto, width=1024, height=1024), (1024, 1024, 512))
+        self.assertEqual(_resolve_splash_config(args_auto, width=2048, height=2048), (1024, 2048, 512))
         self.assertEqual(
             _parse_splash_configs("512x1024x512,1024,1024x2048", "512"),
             [(512, 1024, 512), (1024, 1024, 1024), (1024, 2048, 1024)],

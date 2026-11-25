@@ -82,7 +82,12 @@ def _resolve_splash_config(
     width: int,
     height: int,
 ) -> tuple[int, int, int]:
-    """Resolve ``(block_q, block_kv, block_kv_compute)`` from CLI flags and resolution."""
+    """Resolve ``(block_q, block_kv, block_kv_compute)`` from CLI flags and resolution.
+
+    TPU v6e-1 empirical defaults (from microbench_1k/2k on JAX 0.12.1):
+    - 1K (~1 MP): 1024x1024x512
+    - 2K (>=2.25 MP): 1024x2048x512
+    """
     is_hi_res = (width * height) >= (1536 * 1536)
     base = args.splash_tile
     if base is not None:
@@ -90,8 +95,8 @@ def _resolve_splash_config(
         bkv = args.splash_block_kv if args.splash_block_kv is not None else base
         bkvc = args.splash_block_kv_compute if args.splash_block_kv_compute is not None else min(bq, bkv)
     else:
-        bq = args.splash_block_q if args.splash_block_q is not None else (1024 if is_hi_res else 512)
-        bkv = args.splash_block_kv if args.splash_block_kv is not None else 1024
+        bq = args.splash_block_q if args.splash_block_q is not None else 1024
+        bkv = args.splash_block_kv if args.splash_block_kv is not None else (2048 if is_hi_res else 1024)
         bkvc = args.splash_block_kv_compute if args.splash_block_kv_compute is not None else 512
     return int(bq), int(bkv), int(bkvc)
 
@@ -1430,8 +1435,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--attn-impl", choices=("auto", "splash", "flash", "xla", "einsum"), default="auto")
     p.add_argument("--attn-impls", type=str, default="splash")
     p.add_argument("--splash-tile", type=int, default=None, help="Symmetric Splash tile shorthand (overrides auto)")
-    p.add_argument("--splash-block-q", type=int, default=None, help="SplashAttention block_q (default: 512@1K, 1024@2K)")
-    p.add_argument("--splash-block-kv", type=int, default=None, help="SplashAttention block_kv (default: 1024)")
+    p.add_argument("--splash-block-q", type=int, default=None, help="SplashAttention block_q (default: 1024)")
+    p.add_argument("--splash-block-kv", type=int, default=None, help="SplashAttention block_kv (default: 1024@1K, 2048@2K)")
     p.add_argument("--splash-block-kv-compute", type=int, default=None, help="SplashAttention block_kv_compute (default: 512)")
     p.add_argument("--splash-tiles", type=str, default="512,1024", help="Fallback symmetric tiles for bench")
     p.add_argument(
