@@ -38,7 +38,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 
-from tpu_jax.config import Krea2DiTConfig, PallasGqaOptions
+from tpu_jax.config import Krea2DiTConfig
 from tpu_jax.scheduler import roundup
 
 VALID_ATTN_IMPLS = ("splash", "flash", "xla", "einsum", "pallas_gqa")
@@ -545,14 +545,14 @@ def _gqa_attention(
 
 def _pallas_gqa(
     q, k, v, valid_mask, block_q, block_kv, block_kv_compute, static_valid_len, *,
-    options: PallasGqaOptions = PallasGqaOptions(), grouped_q: bool = False,
+    grouped_q: bool = False,
 ):
     from tpu_jax.pallas_gqa_attn import pallas_gqa_attention
 
     bq, bkv, bkvc, _, _ = _resolve_splash_block_sizes(q.shape[2], block_q, block_kv, block_kv_compute)
     return pallas_gqa_attention(
         q, k, v, valid_mask, block_q=bq, block_kv=bkv, block_kv_compute=bkvc,
-        static_valid_len=static_valid_len, options=options, grouped_q=grouped_q,
+        static_valid_len=static_valid_len, grouped_q=grouped_q,
     )
 
 
@@ -573,7 +573,6 @@ def _attention_block_op(
     splash_block_kv_compute: int,
     static_valid_len: int | None = None,
     tp_size: int = 1,
-    pallas_options: PallasGqaOptions = PallasGqaOptions(),
 ) -> jnp.ndarray:
     """Fused contiguous QKVGate -> QK-Norm -> half-split RoPE -> GQA -> Sigmoid-Gate -> Wo."""
     batch, seq_len, _ = y.shape
@@ -612,7 +611,7 @@ def _attention_block_op(
     if grouped:
         attn_out = _pallas_gqa(
             q, k, v, valid_mask, splash_block_q, splash_block_kv, splash_block_kv_compute, static_valid_len,
-            options=pallas_options, grouped_q=True,
+            grouped_q=True,
         )
     else:
         attn_out = _gqa_attention(
@@ -695,7 +694,6 @@ def _single_stream_block_forward(
     splash_block_kv_compute: int,
     static_valid_len: int | None = None,
     tp_size: int = 1,
-    pallas_options: PallasGqaOptions = PallasGqaOptions(),
 ) -> jnp.ndarray:
     """Single Krea 2 ``SingleStreamBlock`` forward (``jax.lax.scan`` body)."""
     w_dtype = block["mod_lin"].dtype
@@ -719,7 +717,6 @@ def _single_stream_block_forward(
         splash_block_kv_compute=splash_block_kv_compute,
         static_valid_len=static_valid_len,
         tp_size=tp_size,
-        pallas_options=pallas_options,
     )
     x = x + pregate * attn_out
 
@@ -951,7 +948,6 @@ def dit_forward_precomputed(
     scan_unroll: int = 1,
     img_first: bool = True,
     tp_size: int | None = None,
-    pallas_options: PallasGqaOptions = PallasGqaOptions(),
 ) -> jnp.ndarray:
     """Single Krea 2 DiT forward pass using precomputed text conditioning and RoPE.
 
@@ -1002,7 +998,6 @@ def dit_forward_precomputed(
         splash_block_kv_compute=bkvc,
         static_valid_len=static_valid_len if img_first else None,
         tp_size=eff_tp_size,
-        pallas_options=pallas_options,
     )
 
     def _scan_body(carry: jnp.ndarray, blk: dict[str, jnp.ndarray]):
@@ -1061,7 +1056,6 @@ def make_denoise_fn(
     tp_size: int | None = None,
     latent_dtype: Any = jnp.float32,
     donate_latents: bool = True,
-    pallas_options: PallasGqaOptions = PallasGqaOptions(),
 ):
     """Build a single ``jax.jit``-compiled full N-step Euler denoising function.
 
@@ -1155,7 +1149,6 @@ def make_denoise_fn(
                     scan_unroll=scan_unroll,
                     img_first=img_first,
                     tp_size=resolved_tp,
-                    pallas_options=pallas_options,
                 ).astype(latent_dtype)
 
                 if do_cfg:
@@ -1178,7 +1171,6 @@ def make_denoise_fn(
                         scan_unroll=scan_unroll,
                         img_first=img_first,
                         tp_size=resolved_tp,
-                        pallas_options=pallas_options,
                     ).astype(latent_dtype)
                     v = cond + jnp.asarray(guidance_scale, dtype=latent_dtype) * (cond - uncond)
                 else:

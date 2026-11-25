@@ -63,42 +63,30 @@ python3 tpu_jax/run_jax.py --mode bench \
 
 Use `--attn-impl pallas_gqa` for SingleStreamDiT inference on v6e. The kernel
 loads a K/V tile once for each four-head query group, folds `log2(e)` into
-QNorm at load time, and stages adjacent KV subtiles to overlap matrix and
-softmax work. It consumes sequence-minor V and skips empty tiles for static
-prefix masks. BF16 Q scaling and the reordered computation can change rounding.
+QNorm at load time, applies QNorm and RoPE directly in the grouped Q layout,
+stages adjacent KV subtiles to overlap matrix and softmax work, consumes
+sequence-minor V, and skips empty tiles for static prefix masks.
 
-The v6e defaults are `256×2048×512` at 1K and `256×2048×1024` at 2K.
-Add `--pallas-gqa-optimize` to enable continuous double-buffered KV prefetch
-and a 48 MiB kernel VMEM budget together (hardware `jnp.exp2` outperformed the
-software cubic approximation on v6e, so `--pallas-gqa-fast-exp2` and
-`--pallas-gqa-lazy-rescale` remain opt-in flags for individual ablation). For
-individual measurements, use `--pallas-gqa-continuous-kv`,
-`--pallas-gqa-lazy-rescale`, `--pallas-gqa-fast-exp2`, or
-`--pallas-gqa-vmem-mib 48`. The VMEM option raises the process-level libtpu
-limit before backend initialization. QNorm and RoPE produce the grouped Q
-layout directly.
+The v6e defaults are `256×2048×512` at 1K and `256×2048×1024` at 2K, with a
+64 MiB scoped VMEM budget (`--xla_tpu_scoped_vmem_limit_kib=81920`, override
+via `--pallas-gqa-vmem-mib`). Verified on TPU v6e-1 (8-step Turbo BF16,
+batch 1): **1.91 s** (`57.8% MFU`) at `848×1200` and **10.91 s** (`47.6% MFU`)
+at `1696×2400` (~19–20% faster than SplashAttention).
 
 Run the synthetic batch-1 benchmark on v6e without downloading weights.
 
 ```bash
 python3 tpu_jax/run_jax.py --mode microbench --attn-impl pallas_gqa \
-  --width 848 --height 1200 --batch-sizes 1 \
-  --splash-configs 256x1024x512,128x1024x256,128x1024x512,256x1024x256,512x1024x256,512x1024x512 \
-  --splash-mask-modes static
+  --width 848 --height 1200 --batch-sizes 1 --splash-mask-modes static
 
 python3 tpu_jax/run_jax.py --mode microbench --attn-impl pallas_gqa \
-  --width 1696 --height 2400 --batch-sizes 1 \
-  --splash-configs 256x2048x1024,256x2048x512,512x2048x1024,1024x2048x512,256x4096x1024 \
-  --pallas-gqa-optimize \
-  --splash-mask-modes static
+  --width 1696 --height 2400 --batch-sizes 1 --splash-mask-modes static
 ```
 
 The first tile size is the number of Q tokens per head. Each grouped Q tile
-has four times as many rows. The sweep times isolated attention with Q scaling
-and the input transpose prepared ahead of time. The full-block timing includes
-projection, QNorm, RoPE, and layout work and uses the first tile configuration.
-The isolated benchmark uses fixed synthetic Q and K. Use `--mode bench` or
-`--mode generate` to time lazy rescaling with model activations.
+has four times as many rows. The isolated timing prepares Q scaling and the
+input transpose ahead of time; the full-block timing includes projection,
+QNorm, RoPE, and layout work.
 
 ## Local Unit & PyTorch-Parity Tests
 

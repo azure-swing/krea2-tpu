@@ -9,79 +9,11 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
-from tpu_jax.config import PallasGqaOptions
 from tpu_jax.dit import _attention_block_op, _gqa_attention
-from tpu_jax.pallas_gqa_attn import _approx_exp2, _softmax_update, pallas_gqa_attention
+from tpu_jax.pallas_gqa_attn import pallas_gqa_attention
 
 
 class TestPallasGqaAttention(unittest.TestCase):
-    def test_approx_exp2_on_normal_values_and_mask(self):
-        values = np.linspace(-126, 8, 65537, dtype=np.float32)
-        reference = np.exp2(values.astype(np.float64))
-        got = np.asarray(jax.jit(_approx_exp2)(jnp.asarray(values)), dtype=np.float64)
-        np.testing.assert_allclose(got, reference, rtol=1.2e-4, atol=0.0)
-        np.testing.assert_array_equal(
-            np.asarray(_approx_exp2(jnp.array([-jnp.inf, -127.0, -1.0, 0.0, 1.0]))),
-            [0.0, 0.0, 0.5, 1.0, 2.0],
-        )
-        non_pos = np.linspace(-126, 0, 16385, dtype=np.float32)
-        np.testing.assert_allclose(
-            np.asarray(jax.jit(partial(_approx_exp2, non_positive=True))(jnp.asarray(non_pos)), dtype=np.float64),
-            np.exp2(non_pos.astype(np.float64)),
-            rtol=1.2e-4,
-            atol=0.0,
-        )
-        np.testing.assert_array_equal(
-            np.asarray(_approx_exp2(jnp.array([-jnp.inf, -127.0, -1.0, 0.0]), non_positive=True)),
-            [0.0, 0.0, 0.5, 1.0],
-        )
-
-    def test_checked_anchor_replays_large_logits(self):
-        anchor = jnp.zeros((2, 1))
-        denom = jnp.ones_like(anchor)
-        opts = PallasGqaOptions(lazy_rescale=True)
-        logits = jnp.tile(jnp.array([[0.5], [0.75]]), (1, 128))
-        for scores, expected_rescale in ((logits, False), (logits.at[0, 0].set(25.0), True)):
-            m, l, p, scale, rescale = _softmax_update(
-                scores, anchor, denom, jnp.float32, dynamic_mask=False, options=opts,
-            )
-            self.assertEqual(bool(rescale), expected_rescale)
-            np.testing.assert_allclose(
-                np.asarray(p / l), np.asarray(jnp.exp2(scores) / (1.0 + jnp.exp2(scores).sum(1, keepdims=True))),
-                rtol=1e-6, atol=1e-7,
-            )
-            np.testing.assert_allclose(np.asarray(scale), np.asarray(jnp.exp2(-m)), rtol=1e-6)
-
-    def test_all_optimizations_across_kv_buffer_reuse(self):
-        seq_len = 541
-        keys = jax.random.split(jax.random.key(49), 3)
-        q = jax.random.normal(keys[0], (1, seq_len, 4, 128)) / np.sqrt(128)
-        k = jax.random.normal(keys[1], (1, seq_len, 1, 128))
-        v = jax.random.normal(keys[2], (1, seq_len, 1, 128)) * 0.2
-        loc = jnp.arange(seq_len)[None, :]
-        options = PallasGqaOptions(fast_exp2=True, continuous_kv=True, lazy_rescale=True)
-        cases = ((525, None), (None, (loc >= 256) & (loc % 3 != 0)), (None, jnp.zeros_like(loc, dtype=bool)))
-        for dtype in (jnp.float32, jnp.bfloat16):
-            qq, kk, vv = (x.astype(dtype) for x in (q, k, v))
-            grouped = (qq.astype(jnp.float32) * np.log2(np.e)).astype(dtype)[:, None, :, :, :]
-            for valid_len, mask in cases:
-                with self.subTest(dtype=dtype, valid_len=valid_len):
-                    fn = jax.jit(partial(
-                        pallas_gqa_attention,
-                        block_q=128, block_kv=256, block_kv_compute=128,
-                        static_valid_len=valid_len, grouped_q=True,
-                        options=options, interpret=jax.default_backend() != "tpu",
-                    ))
-                    got = fn(grouped, kk.transpose(0, 2, 1, 3), vv.transpose(0, 2, 1, 3), mask)
-                    ref_mask = loc < valid_len if valid_len is not None else mask
-                    expected = _gqa_attention(qq, kk, vv, ref_mask, attn_impl="einsum")
-                    expected = jnp.where(jnp.any(ref_mask), expected, 0.0)
-                    tol = 1e-4 if dtype == jnp.float32 else 1e-3
-                    np.testing.assert_allclose(
-                        np.asarray(got, dtype=np.float32), np.asarray(expected, dtype=np.float32),
-                        rtol=tol, atol=tol,
-                    )
-
     def test_masked_attention_against_einsum(self):
         seq_len = 397
         positions = jnp.arange(seq_len)[None, :]
@@ -126,7 +58,7 @@ class TestPallasGqaAttention(unittest.TestCase):
                         atol=tol,
                     )
 
-    def test_attention_block_uses_folded_qnorm_and_head_first_rope(self):
+    def test_attention_block_uses_folded_qnorm_and_grouped_rope(self):
         seq_len, features = 259, 512
         keys = jax.random.split(jax.random.key(23), 4)
         x = jax.random.normal(keys[0], (1, seq_len, features))
@@ -202,53 +134,32 @@ class TestPallasGqaAttention(unittest.TestCase):
 
     def test_lowering_for_v6e_at_issue_resolutions(self):
         mesh = AbstractMesh((), (), abstract_device=AbstractDevice("TPU v6 lite", 1, "tpu"))
-        for seq_len, block_kv in ((4096, 1024), (16128, 2048)):
-            for batch, mask_rows in ((1, 0), (1, 1), (2, 1), (2, 2)):
-                with self.subTest(seq_len=seq_len, batch=batch, mask_rows=mask_rows), use_abstract_mesh(mesh):
-                    q = jax.ShapeDtypeStruct((batch, 48, seq_len, 128), jnp.bfloat16)
+        for seq_len, block_kv_compute in ((4096, 512), (16128, 1024)):
+            for batch, mask_rows, grouped_q in (
+                (1, 0, True),
+                (1, 1, True),
+                (2, 1, False),
+                (2, 2, False),
+            ):
+                with self.subTest(
+                    seq_len=seq_len, batch=batch, mask_rows=mask_rows, grouped_q=grouped_q
+                ), use_abstract_mesh(mesh):
+                    q_shape = (batch, 12, seq_len, 4, 128) if grouped_q else (batch, 48, seq_len, 128)
+                    q = jax.ShapeDtypeStruct(q_shape, jnp.bfloat16)
                     kv = jax.ShapeDtypeStruct((batch, 12, seq_len, 128), jnp.bfloat16)
                     mask = jax.ShapeDtypeStruct((mask_rows, seq_len), jnp.bool_) if mask_rows else None
                     fn = jax.jit(
                         partial(
                             pallas_gqa_attention,
-                            block_q=1024,
-                            block_kv=block_kv,
-                            block_kv_compute=512,
+                            block_q=256,
+                            block_kv=2048,
+                            block_kv_compute=block_kv_compute,
                             static_valid_len=None if mask_rows else seq_len - 17,
+                            grouped_q=grouped_q,
                         )
                     )
                     lowered = fn.trace(q, kv, kv, mask).lower(lowering_platforms=("tpu",))
                     self.assertIn("stablehlo.custom_call", lowered.as_text())
-            for dynamic in (False, True):
-                with self.subTest(seq_len=seq_len, optimized=True, dynamic=dynamic), use_abstract_mesh(mesh):
-                    q = jax.ShapeDtypeStruct((1, 12, seq_len, 4, 128), jnp.bfloat16)
-                    kv = jax.ShapeDtypeStruct((1, 12, seq_len, 128), jnp.bfloat16)
-                    mask = jax.ShapeDtypeStruct((1, seq_len), jnp.bool_) if dynamic else None
-                    fn = jax.jit(partial(
-                        pallas_gqa_attention,
-                        block_q=256,
-                        block_kv=2048,
-                        block_kv_compute=1024 if seq_len == 16128 else 512,
-                        static_valid_len=None if dynamic else seq_len - 17,
-                        grouped_q=True,
-                        options=PallasGqaOptions(True, True, True, 48 * 1024**2),
-                    ))
-                    lowered = fn.trace(q, kv, kv, mask).lower(lowering_platforms=("tpu",))
-                    self.assertIn("stablehlo.custom_call", lowered.as_text())
-        with self.subTest(seq_len=4608, tail_lt_compute_kv=True), use_abstract_mesh(mesh):
-            q = jax.ShapeDtypeStruct((1, 12, 4608, 4, 128), jnp.bfloat16)
-            kv = jax.ShapeDtypeStruct((1, 12, 4608, 128), jnp.bfloat16)
-            fn = jax.jit(partial(
-                pallas_gqa_attention,
-                block_q=256,
-                block_kv=2048,
-                block_kv_compute=512,
-                static_valid_len=4296,
-                grouped_q=True,
-                options=PallasGqaOptions(True, True, True, 48 * 1024**2),
-            ))
-            lowered = fn.trace(q, kv, kv, None).lower(lowering_platforms=("tpu",))
-            self.assertIn("stablehlo.custom_call", lowered.as_text())
 
 
 if __name__ == "__main__":
