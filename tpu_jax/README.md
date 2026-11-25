@@ -59,8 +59,38 @@ python3 tpu_jax/run_jax.py --mode bench \
   --save-report bench_report.json
 ```
 
+## Grouped Pallas Attention on TPU v6e
+
+Use `--attn-impl pallas_gqa` for SingleStreamDiT inference on v6e. The kernel
+loads a K/V tile once for each four-head query group, folds `log2(e)` into
+QNorm at load time, applies QNorm and RoPE directly in the grouped Q layout,
+stages adjacent KV subtiles to overlap matrix and softmax work, consumes
+sequence-minor V, and skips empty tiles for static prefix masks.
+
+The v6e defaults are `256×2048×512` at 1K and `256×2048×1024` at 2K, with a
+64 MiB scoped VMEM budget (`--xla_tpu_scoped_vmem_limit_kib=81920`, override
+via `--pallas-gqa-vmem-mib`). Verified on TPU v6e-1 (8-step Turbo BF16,
+batch 1): **1.91 s** (`57.8% MFU`) at `848×1200` and **10.91 s** (`47.6% MFU`)
+at `1696×2400` (~19–20% faster than SplashAttention).
+
+Run the synthetic batch-1 benchmark on v6e without downloading weights.
+
+```bash
+python3 tpu_jax/run_jax.py --mode microbench --attn-impl pallas_gqa \
+  --width 848 --height 1200 --batch-sizes 1 --splash-mask-modes static
+
+python3 tpu_jax/run_jax.py --mode microbench --attn-impl pallas_gqa \
+  --width 1696 --height 2400 --batch-sizes 1 --splash-mask-modes static
+```
+
+The first tile size is the number of Q tokens per head. Each grouped Q tile
+has four times as many rows. The isolated timing prepares Q scaling and the
+input transpose ahead of time; the full-block timing includes projection,
+QNorm, RoPE, and layout work.
+
 ## Local Unit & PyTorch-Parity Tests
 
 ```bash
 python -m unittest tpu_jax/tests/test_jax_parity.py -v
+python -m unittest tpu_jax.tests.test_pallas_gqa_attn -v
 ```

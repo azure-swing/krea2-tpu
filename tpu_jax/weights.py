@@ -31,7 +31,7 @@ import ml_dtypes
 import numpy as np
 
 from tpu_jax.config import Krea2DiTConfig, Qwen3TextConfig, QwenImageVAEConfig
-from tpu_jax.dit import precompute_rope_omegas
+from tpu_jax.dit import _LOG2_E, precompute_rope_omegas
 
 
 def _default_num_workers(num_workers: int | None = None) -> int:
@@ -437,14 +437,14 @@ def _build_dit_params(
         with ThreadPoolExecutor(max_workers=min(num_workers, n_layers)) as ex:
             list(ex.map(fn, range(n_layers)))
 
-    def _stream_1d_norm(
+    def _read_1d_norm(
         suffix_diff: str,
         suffix_nat: str,
         length: int,
         *,
         perm: np.ndarray | None = None,
         scale_factor: np.float32 | None = None,
-    ):
+    ) -> np.ndarray:
         buf = np.empty((n_layers, length), dtype=f32)
         suf = suffix_diff if is_diffusers else suffix_nat
 
@@ -457,9 +457,7 @@ def _build_dit_params(
             buf[i] = v
 
         _run_parallel(_fill)
-        res = put_fn(buf, None)
-        del buf
-        return res
+        return buf
 
     def _stream_2d_linear(
         suffix_diff: str, suffix_nat: str, shape_2d: tuple[int, int], spec: Any, scale_spec: Any
@@ -596,21 +594,21 @@ def _build_dit_params(
     mlp_down_w, mlp_down_s = _stream_2d_linear(
         "ff.down.weight", "mlp.down.weight", (mlp_dim, dim), P(None, tp_axis, None), P()
     )
+    qnorm = _read_1d_norm(
+        "attn.norm_q.weight",
+        "attn.qknorm.qnorm.scale",
+        hd,
+        perm=rope_perm,
+        scale_factor=q_inv_sqrt,
+    )
     blocks = {
-        "prenorm": _stream_1d_norm("norm1.weight", "prenorm.scale", dim),
-        "postnorm": _stream_1d_norm("norm2.weight", "postnorm.scale", dim),
-        "qnorm": _stream_1d_norm(
-            "attn.norm_q.weight",
-            "attn.qknorm.qnorm.scale",
-            hd,
-            perm=rope_perm,
-            scale_factor=q_inv_sqrt,
-        ),
-        "knorm": _stream_1d_norm(
-            "attn.norm_k.weight",
-            "attn.qknorm.knorm.scale",
-            hd,
-            perm=rope_perm,
+        "prenorm": put_fn(_read_1d_norm("norm1.weight", "prenorm.scale", dim), None),
+        "postnorm": put_fn(_read_1d_norm("norm2.weight", "postnorm.scale", dim), None),
+        "qnorm": put_fn(qnorm, None),
+        "qnorm_log2": put_fn(qnorm * _LOG2_E, None),
+        "knorm": put_fn(
+            _read_1d_norm("attn.norm_k.weight", "attn.qknorm.knorm.scale", hd, perm=rope_perm),
+            None,
         ),
         "mod_lin": _stream_mod_lin(),
         "qkvgate_w": qkvgate_w,

@@ -140,18 +140,18 @@ def _native_to_diffusers_state_dict(sd: dict[str, np.ndarray]) -> dict[str, np.n
 
 @unittest.skipUnless(HAS_JAX, "JAX is not installed in this environment")
 class TestJaxDiTParity(unittest.TestCase):
-    def _make_tiny_models(self):
+    def _make_tiny_models(self, *, features=128, heads=8, consume=False):
         import jax.numpy as jnp
         import mmdit
         from tpu_jax.weights import build_dit_params_from_state_dict
 
         torch.manual_seed(42)
         pt_cfg = mmdit.SingleMMDiTConfig(
-            features=128,
+            features=features,
             tdim=32,
             txtdim=64,
-            heads=8,
-            kvheads=2,
+            heads=heads,
+            kvheads=heads // 4,
             multiplier=2,
             layers=3,
             patch=2,
@@ -163,11 +163,11 @@ class TestJaxDiTParity(unittest.TestCase):
             txtkvheads=4,
         )
         jax_cfg = Krea2DiTConfig(
-            features=128,
+            features=features,
             tdim=32,
             txtdim=64,
-            heads=8,
-            kvheads=2,
+            heads=heads,
+            kvheads=heads // 4,
             multiplier=2,
             layers=3,
             patch=2,
@@ -186,9 +186,13 @@ class TestJaxDiTParity(unittest.TestCase):
                     p.normal_(mean=0.0, std=0.2)
 
         raw_sd = {k: v.detach().cpu().float().numpy() for k, v in pt_model.state_dict().items()}
-        jax_params_native = build_dit_params_from_state_dict(raw_sd, jax_cfg, dtype=jnp.float32)
         diffusers_sd = _native_to_diffusers_state_dict(raw_sd)
-        jax_params_diffusers = build_dit_params_from_state_dict(diffusers_sd, jax_cfg, dtype=jnp.float32)
+        jax_params_native = build_dit_params_from_state_dict(
+            raw_sd, jax_cfg, dtype=jnp.float32, consume=consume
+        )
+        jax_params_diffusers = build_dit_params_from_state_dict(
+            diffusers_sd, jax_cfg, dtype=jnp.float32, consume=consume
+        )
         return pt_model, jax_cfg, jax_params_native, jax_params_diffusers
 
     def test_single_forward_matches_pytorch_native_and_diffusers(self):
@@ -254,6 +258,49 @@ class TestJaxDiTParity(unittest.TestCase):
                     atol=2e-4,
                     err_msg=f"Mismatch for format={label}, attn_impl={impl}",
                 )
+
+    def test_pallas_gqa_dit_forward_with_consumed_weights_matches_pytorch(self):
+        from functools import partial
+
+        import jax
+        import jax.numpy as jnp
+        import mmdit
+        import sampling
+        from tpu_jax.dit import dit_forward_precomputed, patchify_latents, prepare_text_conditioning
+        from tpu_jax.pallas_gqa_attn import pallas_gqa_attention
+
+        pt_model, cfg, native, diffusers = self._make_tiny_models(features=512, heads=4, consume=True)
+        torch.manual_seed(7)
+        latents = torch.randn(1, 4, 8, 8)
+        context = torch.randn(1, 8, cfg.txtlayers, cfg.txtdim)
+        mask = torch.tensor([[1, 1, 0, 0, 1, 1, 1, 0]], dtype=torch.bool)
+        t = torch.tensor([0.75])
+        tok_pt, pos_pt, mask_pt = sampling.prepare(latents, mask.shape[1], cfg.patch, mask)
+        with torch.no_grad(), patch.object(mmdit, "sdpa_kernel", lambda *_a, **_kw: nullcontext()):
+            expected = pt_model(tok_pt, context, t, pos_pt, mask_pt).numpy()
+
+        tok = patchify_latents(jnp.asarray(latents.numpy()), patch=cfg.patch)
+        t_j = jnp.asarray(t.numpy())
+        context_j = jnp.asarray(context.numpy())
+        mask_j = jnp.asarray(mask.numpy())
+        with patch(
+            "tpu_jax.pallas_gqa_attn.pallas_gqa_attention",
+            partial(pallas_gqa_attention, interpret=jax.default_backend() != "tpu"),
+        ):
+            for params in (native, diffusers):
+                block_weights = params["blocks"]
+                np.testing.assert_array_equal(
+                    np.asarray(block_weights["qnorm_log2"]),
+                    np.asarray(block_weights["qnorm"]) * np.float32(np.log2(np.e)),
+                )
+                text, cos, sin, valid, pad_len = prepare_text_conditioning(
+                    params, cfg, context_j, mask_j, latent_h=8, latent_w=8, attn_impl="pallas_gqa",
+                )
+                got = dit_forward_precomputed(
+                    params, cfg, tok, t_j, text, cos, sin, valid, pad_len=pad_len,
+                    attn_impl="pallas_gqa", splash_block_q=128, splash_block_kv=256, splash_block_kv_compute=128,
+                )
+                np.testing.assert_allclose(np.asarray(got), expected, rtol=1e-4, atol=2e-4)
 
     def test_full_euler_denoise_loop_turbo_and_cfg(self):
         import jax.numpy as jnp
@@ -472,6 +519,33 @@ class TestRunnerAndSplashHelpers(unittest.TestCase):
             self.assertEqual(len(saved), 5)
             with Image.open(saved[-1]) as grid_img:
                 self.assertEqual(grid_img.size, (96, 64))
+
+    def test_pallas_benchmark_defaults_and_vmem_config(self):
+        from tpu_jax.run_jax import (
+            _benchmark_batch_sizes,
+            _benchmark_tile_configs,
+            _configure_pallas_vmem,
+            _requested_attn_impls,
+            _resolve_pallas_vmem_mib,
+            build_parser,
+        )
+
+        parser = build_parser()
+        args = parser.parse_args(["--attn-impl", "pallas_gqa"])
+        impls = _requested_attn_impls(args)
+        self.assertEqual(impls, ["pallas_gqa"])
+        self.assertEqual(_benchmark_batch_sizes(args, impls), [1])
+        self.assertEqual(_benchmark_tile_configs(args, impls[0], 848, 1200), [(256, 2048, 512)])
+        self.assertEqual(_benchmark_tile_configs(args, impls[0], 1696, 2400), [(256, 2048, 1024)])
+        vmem_mib = _resolve_pallas_vmem_mib(args)
+        self.assertEqual(vmem_mib, 64)
+        self.assertIsNone(_resolve_pallas_vmem_mib(parser.parse_args(["--attn-impl", "splash"])))
+        with patch.dict(os.environ, {"LIBTPU_INIT_ARGS": "--other --xla_tpu_scoped_vmem_limit_kib=32768"}):
+            _configure_pallas_vmem(vmem_mib)
+            self.assertEqual(os.environ["LIBTPU_INIT_ARGS"], "--other --xla_tpu_scoped_vmem_limit_kib=81920")
+        with patch.dict(os.environ, {"LIBTPU_INIT_ARGS": "--xla_tpu_scoped_vmem_limit_kib=98304"}):
+            _configure_pallas_vmem(vmem_mib)
+            self.assertEqual(os.environ["LIBTPU_INIT_ARGS"], "--xla_tpu_scoped_vmem_limit_kib=98304")
 
     @unittest.skipUnless(HAS_JAX, "JAX is not installed in this environment")
     def test_splash_helpers_and_static_mask_builder(self):
