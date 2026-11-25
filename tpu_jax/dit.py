@@ -196,23 +196,86 @@ def _resolve_splash_block_sizes(
     return eff_bq, eff_bkv, eff_bkvc, q_padded, kv_padded
 
 
+def _make_prefix_valid_mask(
+    q_padded: int,
+    kv_padded: int,
+    valid_len: int,
+    splash_attention_mask: Any,
+) -> Any:
+    """Build a lazy O(1)-memory compile-time prefix mask for ``kv < valid_len``.
+
+    Avoids materializing or repeatedly hashing a dense ``(q_padded, kv_padded)`` boolean
+    array (which is ~289 MiB at 2048x2048 and takes tens of seconds in ``NumpyMask``).
+    Every block with ``kv_end <= valid_len`` returns all-True (``FULL``, zero VPU mask ops);
+    every block with ``kv_start >= valid_len`` returns all-False (``EMPTY``, skipped); and
+    allowing all query rows to attend to ``kv < valid_len`` avoids all-False softmax rows.
+    """
+    if valid_len >= kv_padded:
+        return splash_attention_mask.FullMask((q_padded, kv_padded))
+
+    base_cls = getattr(splash_attention_mask, "Mask", object)
+    shape = (int(q_padded), int(kv_padded))
+    vlen = int(valid_len)
+
+    # Cache the dynamically bound subclass per splash_attention_mask module so __eq__/__hash__ match.
+    cls = getattr(_make_prefix_valid_mask, "_cls_cache", {}).get(base_cls)
+    if cls is None:
+
+        class _PrefixValidMask(base_cls):
+            def __init__(self, mask_shape: tuple[int, int], prefix_len: int):
+                self._shape = (int(mask_shape[0]), int(mask_shape[1]))
+                self._valid_len = int(prefix_len)
+
+            @property
+            def shape(self) -> tuple[int, int]:
+                return self._shape
+
+            def __getitem__(self, idx) -> np.ndarray:
+                if len(idx) != 2:
+                    raise NotImplementedError(f"Unsupported slice: {idx}")
+                q_slice, kv_slice = idx
+                if not isinstance(q_slice, slice) or not isinstance(kv_slice, slice):
+                    raise NotImplementedError(f"Unsupported slice: {idx}")
+                q_start, q_stop, q_step = q_slice.indices(self._shape[0])
+                kv_start, kv_stop, kv_step = kv_slice.indices(self._shape[1])
+                if q_step != 1 or kv_step != 1:
+                    raise NotImplementedError(f"Unsupported stepped slice: {idx}")
+                q_len = max(0, q_stop - q_start)
+                kv_len = max(0, kv_stop - kv_start)
+                if kv_stop <= self._valid_len:
+                    return np.ones((q_len, kv_len), dtype=np.bool_)
+                if kv_start >= self._valid_len:
+                    return np.zeros((q_len, kv_len), dtype=np.bool_)
+                out = np.zeros((q_len, kv_len), dtype=np.bool_)
+                out[:, : self._valid_len - kv_start] = True
+                return out
+
+            def __eq__(self, other: object) -> bool:
+                if not isinstance(other, _PrefixValidMask):
+                    return NotImplemented
+                return self._shape == other._shape and self._valid_len == other._valid_len
+
+            def __hash__(self) -> int:
+                return hash((_PrefixValidMask, self._shape, self._valid_len))
+
+        cache = getattr(_make_prefix_valid_mask, "_cls_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(_make_prefix_valid_mask, "_cls_cache", cache)
+        cache[base_cls] = _PrefixValidMask
+        cls = _PrefixValidMask
+
+    return cls(shape, vlen)
+
+
 def _build_static_splash_mask(
     q_padded: int,
     kv_padded: int,
     valid_len: int,
     splash_attention_mask: Any,
 ) -> Any:
-    """Build compile-time static mask for contiguous valid prefix ``[0, valid_len)``.
-
-    Every block with ``kv_end <= valid_len`` compiles as ``FULL`` (zero VPU mask ops);
-    every block with ``kv_start >= valid_len`` compiles as ``EMPTY`` (skipped); and
-    setting ``m[:, :valid_len] = True`` ensures no padded query row is all-False (zero NaN risk).
-    """
-    if valid_len >= kv_padded:
-        return splash_attention_mask.FullMask((q_padded, kv_padded))
-    m_np = np.zeros((q_padded, kv_padded), dtype=np.bool_)
-    m_np[:, :valid_len] = True
-    return splash_attention_mask.NumpyMask(m_np)
+    """Build compile-time lazy static mask for contiguous valid prefix ``[0, valid_len)``."""
+    return _make_prefix_valid_mask(q_padded, kv_padded, valid_len, splash_attention_mask)
 
 
 def _splash_attention(
@@ -739,6 +802,85 @@ def prepare_text_conditioning(
     return text_tokens, rope_cos, rope_sin, valid_mask, pad_len
 
 
+def _axis_shard_count(arr: Any, axis: int) -> int | None:
+    """Infer how many shards partition ``arr`` along ``axis`` from its JAX sharding."""
+    sharding = getattr(arr, "sharding", None)
+    if sharding is None:
+        aval = getattr(arr, "aval", None)
+        sharding = getattr(aval, "sharding", None)
+    if sharding is None:
+        return None
+    shape = getattr(arr, "shape", None)
+    if shape is None:
+        return None
+    ax = axis if axis >= 0 else len(shape) + axis
+    shard_shape_fn = getattr(sharding, "shard_shape", None)
+    if callable(shard_shape_fn):
+        try:
+            s_shape = shard_shape_fn(tuple(shape))
+            if s_shape[ax] > 0:
+                return int(shape[ax] // s_shape[ax])
+        except Exception:
+            pass
+    mesh = getattr(sharding, "mesh", None)
+    spec = getattr(sharding, "spec", None)
+    if mesh is not None and spec is not None and ax < len(spec):
+        ax_spec = spec[ax]
+        if ax_spec is None:
+            return 1
+        names = (ax_spec,) if isinstance(ax_spec, str) else tuple(ax_spec)
+        prod = 1
+        for name in names:
+            if name is not None:
+                prod *= int(mesh.shape[name])
+        return prod
+    return None
+
+
+def infer_and_validate_tp_size(params: dict[str, Any], tp_size: int | None = None) -> int:
+    """Infer and validate TP layout shard count from sharded DiT block weights.
+
+    Prevents silent numerical corruption when weights are loaded for a multi-chip TP
+    mesh (packing fused ``qkvgate_w`` / ``mlp_gate_up_w`` per TP shard) while a caller
+    leaves ``tp_size`` defaulted to 1.
+    """
+    blocks = params.get("blocks")
+    inferred: dict[str, int] = {}
+    if isinstance(blocks, dict):
+        for key, ax in (
+            ("qkvgate_w", -1),
+            ("mlp_gate_up_w", -1),
+            ("wo_w", -2),
+            ("mlp_down_w", -2),
+        ):
+            if key in blocks:
+                cnt = _axis_shard_count(blocks[key], ax)
+                if cnt is not None:
+                    inferred[key] = cnt
+
+    unique_counts = set(inferred.values())
+    if len(unique_counts) > 1:
+        raise ValueError(
+            f"Inconsistent TP sharding across DiT block weights: {inferred}. "
+            "Ensure all fused projections are sharded with the same 1D TP mesh."
+        )
+    sharded_tp = next(iter(unique_counts)) if unique_counts else 1
+
+    if tp_size is None:
+        return sharded_tp
+
+    req_tp = int(tp_size)
+    if req_tp < 1:
+        raise ValueError(f"tp_size must be >= 1, got {req_tp}.")
+    if sharded_tp > 1 and req_tp != sharded_tp:
+        raise ValueError(
+            f"DiT weights are sharded for tp_size={sharded_tp} ({inferred}), "
+            f"which does not match requested tp_size={req_tp}. "
+            "Pass tp_size=None (auto) or the matching mesh TP size."
+        )
+    return req_tp
+
+
 def dit_forward_precomputed(
     params: dict[str, Any],
     config: Krea2DiTConfig,
@@ -758,13 +900,15 @@ def dit_forward_precomputed(
     static_valid_len: int | None = None,
     scan_unroll: int = 1,
     img_first: bool = True,
-    tp_size: int = 1,
+    tp_size: int | None = None,
 ) -> jnp.ndarray:
     """Single Krea 2 DiT forward pass using precomputed text conditioning and RoPE.
 
     Supports broadcasting ``text_tokens`` / ``rope_cos`` / ``rope_sin`` / ``valid_mask``
     from batch=1 across ``batch > 1`` ``img_tokens`` (multi-seed batch generation).
+    When ``tp_size=None`` (default), infers TP layout automatically from ``params`` sharding.
     """
+    eff_tp_size = infer_and_validate_tp_size(params, tp_size)
     w_dtype = params["first_w"].dtype
     batch, img_len, _ = img_tokens.shape
     txt_len = text_tokens.shape[1]
@@ -806,7 +950,7 @@ def dit_forward_precomputed(
         splash_block_kv=bkv,
         splash_block_kv_compute=bkvc,
         static_valid_len=static_valid_len if img_first else None,
-        tp_size=tp_size,
+        tp_size=eff_tp_size,
     )
 
     def _scan_body(carry: jnp.ndarray, blk: dict[str, jnp.ndarray]):
@@ -862,7 +1006,7 @@ def make_denoise_fn(
     scan_unroll: int = 1,
     gemm_pad_multiple: int = 256,
     img_first: bool = True,
-    tp_size: int = 1,
+    tp_size: int | None = None,
     latent_dtype: Any = jnp.float32,
     donate_latents: bool = True,
 ):
@@ -874,6 +1018,8 @@ def make_denoise_fn(
       ``v = cond + guidance_scale * (cond - uncond)`` (exact match to ``sampling.py``).
     - Supports ``init_latents [B, C, H, W]`` with ``pos_context [1, L, 12, D]``
       (runs TextFusion once and broadcasts across all ``B`` seeds!).
+    - When ``tp_size=None`` (default), infers and validates the TP weight layout
+      from ``params`` sharding before execution.
     """
     align = 8 * config.patch
     w_aligned = roundup(width, align)
@@ -882,8 +1028,121 @@ def make_denoise_fn(
     latent_w = w_aligned // 8
     do_cfg = guidance_scale > 0.0
     donate = (1,) if donate_latents else ()
+    compiled_by_tp: dict[int, Any] = {}
 
-    @partial(jax.jit, donate_argnums=donate)
+    def _get_jitted(resolved_tp: int):
+        fn = compiled_by_tp.get(resolved_tp)
+        if fn is not None:
+            return fn
+
+        @partial(jax.jit, donate_argnums=donate)
+        def _denoise_inner(
+            params: dict[str, Any],
+            init_latents: jnp.ndarray,
+            pos_context: jnp.ndarray,
+            pos_txtmask: jnp.ndarray,
+            neg_context: jnp.ndarray | None,
+            neg_txtmask: jnp.ndarray | None,
+            ts: jnp.ndarray,
+        ) -> jnp.ndarray:
+            num_steps = ts.shape[0] - 1
+            img_tokens = patchify_latents(init_latents.astype(latent_dtype), patch=config.patch)
+
+            pos_txt, pos_cos, pos_sin, pos_mask, pos_pad = prepare_text_conditioning(
+                params,
+                config,
+                pos_context,
+                pos_txtmask,
+                latent_h=latent_h,
+                latent_w=latent_w,
+                attn_impl=attn_impl,
+                splash_block_size=splash_block_size,
+                gemm_pad_multiple=gemm_pad_multiple,
+                img_first=img_first,
+            )
+            if do_cfg:
+                assert neg_context is not None and neg_txtmask is not None
+                neg_txt, neg_cos, neg_sin, neg_mask, neg_pad = prepare_text_conditioning(
+                    params,
+                    config,
+                    neg_context,
+                    neg_txtmask,
+                    latent_h=latent_h,
+                    latent_w=latent_w,
+                    attn_impl=attn_impl,
+                    splash_block_size=splash_block_size,
+                    gemm_pad_multiple=gemm_pad_multiple,
+                    img_first=img_first,
+                )
+            else:
+                neg_txt = neg_cos = neg_sin = neg_mask = None
+                neg_pad = 0
+
+            def _step(step_idx: int, cur_tokens: jnp.ndarray) -> jnp.ndarray:
+                t_curr = ts[step_idx]
+                t_prev = ts[step_idx + 1]
+                dt = (t_prev - t_curr).astype(latent_dtype)
+
+                cond = dit_forward_precomputed(
+                    params,
+                    config,
+                    cur_tokens,
+                    t_curr,
+                    pos_txt,
+                    pos_cos,
+                    pos_sin,
+                    pos_mask,
+                    pad_len=pos_pad,
+                    attn_impl=attn_impl,
+                    splash_block_size=splash_block_size,
+                    splash_block_q=splash_block_q,
+                    splash_block_kv=splash_block_kv,
+                    splash_block_kv_compute=splash_block_kv_compute,
+                    static_valid_len=pos_static_valid_len,
+                    scan_unroll=scan_unroll,
+                    img_first=img_first,
+                    tp_size=resolved_tp,
+                ).astype(latent_dtype)
+
+                if do_cfg:
+                    uncond = dit_forward_precomputed(
+                        params,
+                        config,
+                        cur_tokens,
+                        t_curr,
+                        neg_txt,
+                        neg_cos,
+                        neg_sin,
+                        neg_mask,
+                        pad_len=neg_pad,
+                        attn_impl=attn_impl,
+                        splash_block_size=splash_block_size,
+                        splash_block_q=splash_block_q,
+                        splash_block_kv=splash_block_kv,
+                        splash_block_kv_compute=splash_block_kv_compute,
+                        static_valid_len=neg_static_valid_len,
+                        scan_unroll=scan_unroll,
+                        img_first=img_first,
+                        tp_size=resolved_tp,
+                    ).astype(latent_dtype)
+                    v = cond + jnp.asarray(guidance_scale, dtype=latent_dtype) * (cond - uncond)
+                else:
+                    v = cond
+
+                return cur_tokens + dt * v
+
+            final_tokens = lax.fori_loop(0, num_steps, _step, img_tokens)
+            return unpatchify_latents(
+                final_tokens,
+                latent_h=latent_h,
+                latent_w=latent_w,
+                channels=config.channels,
+                patch=config.patch,
+            )
+
+        compiled_by_tp[resolved_tp] = _denoise_inner
+        return _denoise_inner
+
     def _denoise(
         params: dict[str, Any],
         init_latents: jnp.ndarray,
@@ -893,99 +1152,9 @@ def make_denoise_fn(
         neg_txtmask: jnp.ndarray | None,
         ts: jnp.ndarray,
     ) -> jnp.ndarray:
-        num_steps = ts.shape[0] - 1
-        img_tokens = patchify_latents(init_latents.astype(latent_dtype), patch=config.patch)
-
-        pos_txt, pos_cos, pos_sin, pos_mask, pos_pad = prepare_text_conditioning(
-            params,
-            config,
-            pos_context,
-            pos_txtmask,
-            latent_h=latent_h,
-            latent_w=latent_w,
-            attn_impl=attn_impl,
-            splash_block_size=splash_block_size,
-            gemm_pad_multiple=gemm_pad_multiple,
-            img_first=img_first,
-        )
-        if do_cfg:
-            assert neg_context is not None and neg_txtmask is not None
-            neg_txt, neg_cos, neg_sin, neg_mask, neg_pad = prepare_text_conditioning(
-                params,
-                config,
-                neg_context,
-                neg_txtmask,
-                latent_h=latent_h,
-                latent_w=latent_w,
-                attn_impl=attn_impl,
-                splash_block_size=splash_block_size,
-                gemm_pad_multiple=gemm_pad_multiple,
-                img_first=img_first,
-            )
-        else:
-            neg_txt = neg_cos = neg_sin = neg_mask = None
-            neg_pad = 0
-
-        def _step(step_idx: int, cur_tokens: jnp.ndarray) -> jnp.ndarray:
-            t_curr = ts[step_idx]
-            t_prev = ts[step_idx + 1]
-            dt = (t_prev - t_curr).astype(latent_dtype)
-
-            cond = dit_forward_precomputed(
-                params,
-                config,
-                cur_tokens,
-                t_curr,
-                pos_txt,
-                pos_cos,
-                pos_sin,
-                pos_mask,
-                pad_len=pos_pad,
-                attn_impl=attn_impl,
-                splash_block_size=splash_block_size,
-                splash_block_q=splash_block_q,
-                splash_block_kv=splash_block_kv,
-                splash_block_kv_compute=splash_block_kv_compute,
-                static_valid_len=pos_static_valid_len,
-                scan_unroll=scan_unroll,
-                img_first=img_first,
-                tp_size=tp_size,
-            ).astype(latent_dtype)
-
-            if do_cfg:
-                uncond = dit_forward_precomputed(
-                    params,
-                    config,
-                    cur_tokens,
-                    t_curr,
-                    neg_txt,
-                    neg_cos,
-                    neg_sin,
-                    neg_mask,
-                    pad_len=neg_pad,
-                    attn_impl=attn_impl,
-                    splash_block_size=splash_block_size,
-                    splash_block_q=splash_block_q,
-                    splash_block_kv=splash_block_kv,
-                    splash_block_kv_compute=splash_block_kv_compute,
-                    static_valid_len=neg_static_valid_len,
-                    scan_unroll=scan_unroll,
-                    img_first=img_first,
-                    tp_size=tp_size,
-                ).astype(latent_dtype)
-                v = cond + jnp.asarray(guidance_scale, dtype=latent_dtype) * (cond - uncond)
-            else:
-                v = cond
-
-            return cur_tokens + dt * v
-
-        final_tokens = lax.fori_loop(0, num_steps, _step, img_tokens)
-        return unpatchify_latents(
-            final_tokens,
-            latent_h=latent_h,
-            latent_w=latent_w,
-            channels=config.channels,
-            patch=config.patch,
+        resolved_tp = infer_and_validate_tp_size(params, tp_size)
+        return _get_jitted(resolved_tp)(
+            params, init_latents, pos_context, pos_txtmask, neg_context, neg_txtmask, ts
         )
 
     return _denoise

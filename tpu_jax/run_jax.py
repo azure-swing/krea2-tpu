@@ -333,6 +333,58 @@ def _encode_prompts_stage1(
     return results, metrics
 
 
+def _load_cached_prompt_embeds(
+    data: Any,
+    *,
+    num_images: int,
+    do_cfg: bool,
+) -> dict[str, np.ndarray]:
+    """Load and validate cached ``.npz`` prompt embeddings without silently dropping rows.
+
+    Accepts either a singleton batch (``batch == 1``, broadcast across ``num_images``) or
+    per-image embeddings matching ``num_images`` (``batch == num_images``).
+    """
+    files = set(data.files) if hasattr(data, "files") else set(data.keys())
+    required = ["pos_context", "pos_txtmask"]
+    if do_cfg:
+        required.extend(["neg_context", "neg_txtmask"])
+    missing = [k for k in required if k not in files]
+    if missing:
+        raise ValueError(f"Cached prompt_embeds is missing required keys: {missing} (found {sorted(files)}).")
+
+    def _validate_pair(prefix: str) -> tuple[np.ndarray, np.ndarray]:
+        ctx = np.asarray(data[f"{prefix}_context"])
+        mask = np.asarray(data[f"{prefix}_txtmask"], dtype=np.bool_)
+        if ctx.ndim != 4:
+            raise ValueError(
+                f"Cached {prefix}_context must be 4D [B, L, N_layers, D], got shape {ctx.shape}."
+            )
+        if mask.ndim != 2:
+            raise ValueError(f"Cached {prefix}_txtmask must be 2D [B, L], got shape {mask.shape}.")
+        if ctx.shape[:2] != mask.shape[:2]:
+            raise ValueError(
+                f"Cached {prefix}_context shape {ctx.shape} does not match {prefix}_txtmask shape {mask.shape}."
+            )
+        b = int(ctx.shape[0])
+        if b not in (1, num_images):
+            raise ValueError(
+                f"Cached {prefix}_context batch size {b} is incompatible with --num-images={num_images} "
+                f"(expected 1 or {num_images})."
+            )
+        return ctx, mask
+
+    pos_ctx, pos_mask = _validate_pair("pos")
+    out: dict[str, np.ndarray] = {
+        "pos_context": pos_ctx,
+        "pos_txtmask": pos_mask,
+    }
+    if do_cfg:
+        neg_ctx, neg_mask = _validate_pair("neg")
+        out["neg_context"] = neg_ctx
+        out["neg_txtmask"] = neg_mask
+    return out
+
+
 def _prepare_embeds_for_dit(
     embeds: dict[str, np.ndarray],
     *,
@@ -463,9 +515,14 @@ def run_generate(args) -> dict[str, Any]:
 
     # --- Stage 1: Encode each unique prompt ONCE (batch=1; DiT broadcasts over --num-images!) ---
     if args.prompt_embeds:
-        data = np.load(args.prompt_embeds, allow_pickle=False)
-        embeds_list = [{k: data[k][:1] for k in data.files}]
-        stage1_metrics: dict[str, Any] = {"loaded_from_cache": str(args.prompt_embeds)}
+        with np.load(args.prompt_embeds, allow_pickle=False) as data:
+            cached_entry = _load_cached_prompt_embeds(data, num_images=args.num_images, do_cfg=do_cfg)
+        embeds_list = [cached_entry]
+        stage1_metrics: dict[str, Any] = {
+            "loaded_from_cache": str(args.prompt_embeds),
+            "cached_pos_batch": int(cached_entry["pos_context"].shape[0]),
+            "cached_neg_batch": int(cached_entry["neg_context"].shape[0]) if do_cfg else None,
+        }
     else:
         prompt_groups = [[p] for p in prompt_list]
         neg_groups = [[args.negative_prompt] for _ in prompt_list] if do_cfg else None
@@ -523,9 +580,12 @@ def run_generate(args) -> dict[str, Any]:
 
     jnp_dtype = jnp.bfloat16 if args.dtype in ("bf16", "bfloat16") else jnp.float32
     all_run_times: list[float] = []
+    run_records: list[dict[str, Any]] = []
     final_latents_list: list[np.ndarray] = []
     denoise_fn_cache: dict[tuple[Any, ...], Any] = {}
+    executed_compile_keys: set[tuple[Any, ...]] = set()
     used_txt_len = 512
+    used_neg_txt_len: int | None = None
     used_static_mask = False
 
     for p_idx, raw_embeds in enumerate(embeds_list):
@@ -535,10 +595,14 @@ def run_generate(args) -> dict[str, Any]:
             compact_text=compact_text,
             text_buckets=text_buckets,
         )
-        txt_len = int(embeds["pos_txtmask"].shape[1])
-        used_txt_len = txt_len
+        pos_txt_len = int(embeds["pos_txtmask"].shape[1])
+        neg_txt_len = int(embeds["neg_txtmask"].shape[1]) if do_cfg else None
+        pos_batch = int(embeds["pos_txtmask"].shape[0])
+        neg_batch = int(embeds["neg_txtmask"].shape[0]) if do_cfg else None
+        used_txt_len = pos_txt_len
+        used_neg_txt_len = neg_txt_len
 
-        # Decide static NumpyMask vs dynamic SegmentIds.
+        # Decide static lazy PrefixMask vs dynamic SegmentIds.
         use_static = False
         if attn_impl == "splash" and compact_text and pos_common_txt is not None:
             if args.splash_mask_mode == "static":
@@ -546,14 +610,14 @@ def run_generate(args) -> dict[str, Any]:
             elif args.splash_mask_mode == "auto":
                 # Single prompt (incl. MJ batch-N): static mask eliminates VPU SegmentIds across all image tiles.
                 # Multi-prompt file: segment mode avoids recompiling per exact prompt token count.
-                use_static = (len(embeds_list) == 1) or (pos_common_txt == txt_len)
+                use_static = (len(embeds_list) == 1) or (pos_common_txt == pos_txt_len)
         used_static_mask = use_static
         pos_static_len = (img_len + pos_common_txt) if use_static and pos_common_txt is not None else None
         neg_static_len = (
             (img_len + neg_common_txt) if (use_static and do_cfg and neg_common_txt is not None) else None
         )
 
-        cache_key = (txt_len, pos_static_len, neg_static_len)
+        cache_key = (pos_txt_len, neg_txt_len, pos_batch, neg_batch, pos_static_len, neg_static_len)
         if cache_key not in denoise_fn_cache:
             denoise_fn_cache[cache_key] = make_denoise_fn(
                 dit_cfg,
@@ -572,6 +636,30 @@ def run_generate(args) -> dict[str, Any]:
                 donate_latents=True,
             )
         denoise_fn = denoise_fn_cache[cache_key]
+
+        pos_step_tf = estimate_step_tflops(
+            dit_cfg,
+            width=args.width,
+            height=args.height,
+            txt_len=pos_txt_len,
+            pad_multiple=256,
+            batch_size=args.num_images,
+            do_cfg=False,
+        )
+        neg_step_tf = (
+            estimate_step_tflops(
+                dit_cfg,
+                width=args.width,
+                height=args.height,
+                txt_len=neg_txt_len,
+                pad_multiple=256,
+                batch_size=args.num_images,
+                do_cfg=False,
+            )
+            if (do_cfg and neg_txt_len is not None)
+            else 0.0
+        )
+        run_step_tflops = pos_step_tf + neg_step_tf
 
         init_lat_np = _make_init_latents(
             batch=args.num_images,
@@ -597,11 +685,29 @@ def run_generate(args) -> dict[str, Any]:
             lat_in = jnp.asarray(init_lat_np, dtype=jnp.float32)
             if mesh is None:
                 lat_in = jax.device_put(lat_in, dev0)
+            is_compiled_cold = cache_key not in executed_compile_keys
             t0 = time.perf_counter()
             out_lat = denoise_fn(dit_params, lat_in, pos_ctx, pos_mask, neg_ctx, neg_mask, ts_j)
             out_lat.block_until_ready()
             dt = time.perf_counter() - t0
+            executed_compile_keys.add(cache_key)
             all_run_times.append(round(dt, 4))
+            run_ach_tf = (run_step_tflops * args.steps) / dt
+            run_records.append(
+                {
+                    "prompt_index": p_idx,
+                    "run_index": r_idx,
+                    "compiled": is_compiled_cold,
+                    "seconds": round(dt, 4),
+                    "pos_txt_len": pos_txt_len,
+                    "neg_txt_len": neg_txt_len,
+                    "pos_static_valid_len": pos_static_len,
+                    "neg_static_valid_len": neg_static_len,
+                    "step_tflops_est": round(run_step_tflops, 2),
+                    "achieved_tflops": round(run_ach_tf, 2),
+                    "mfu_pct_bf16": round(100.0 * run_ach_tf / peak_tflops, 2) if peak_tflops else None,
+                }
+            )
             if r_idx == 0:
                 saved_lat = np.asarray(out_lat, dtype=np.float32)
             release_tpu_pytree(out_lat)
@@ -616,18 +722,13 @@ def run_generate(args) -> dict[str, Any]:
     dit_hbm_after = _memory_stats_gib(dev0)
     dit_host_after = host_memory_stats_gib()
 
-    warm_times = all_run_times[1:] if len(all_run_times) > 1 else all_run_times
-    warm_median = float(statistics.median(warm_times))
-    step_tflops = estimate_step_tflops(
-        dit_cfg,
-        width=args.width,
-        height=args.height,
-        txt_len=used_txt_len,
-        pad_multiple=256,
-        batch_size=args.num_images,
-        do_cfg=do_cfg,
-    )
-    achieved_tflops = (step_tflops * args.steps) / warm_median
+    warm_records = [r for r in run_records if not r["compiled"]]
+    agg_records = warm_records if warm_records else run_records
+    warm_median = float(statistics.median(r["seconds"] for r in agg_records))
+    total_agg_tflops = sum(r["step_tflops_est"] * args.steps for r in agg_records)
+    total_agg_seconds = sum(r["seconds"] for r in agg_records)
+    step_tflops = float(statistics.median(r["step_tflops_est"] for r in agg_records))
+    achieved_tflops = total_agg_tflops / total_agg_seconds if total_agg_seconds > 0 else 0.0
     mfu_pct = round(100.0 * achieved_tflops / peak_tflops, 2) if peak_tflops else None
 
     stage2_metrics = {
@@ -636,12 +737,16 @@ def run_generate(args) -> dict[str, Any]:
         "splash_mask_mode": "static" if used_static_mask else "segment",
         "compact_text": compact_text,
         "effective_txt_len": used_txt_len,
+        "effective_neg_txt_len": used_neg_txt_len,
         "scan_unroll": args.scan_unroll,
         "batch_size": args.num_images,
         "load_and_h2d_seconds": round(dit_load_sec, 3),
         "drop_tpu_seconds": round(dit_drop_sec, 4),
         "freed_leaves": dit_freed,
         "run_seconds": all_run_times,
+        "run_records": run_records,
+        "has_warm_runs": bool(warm_records),
+        "num_compiles": sum(1 for r in run_records if r["compiled"]),
         "cold_seconds": all_run_times[0],
         "warm_median_seconds": round(warm_median, 4),
         "warm_sec_per_image": round(warm_median / max(1, args.num_images), 4),
@@ -759,10 +864,14 @@ def run_bench(args) -> dict[str, Any]:
     comps: tuple[str, ...] = ("dit", "text_encoder", "tokenizer") if need_te else ("dit",)
     model_root, cache_info = _resolve_model_root(args, components=comps)
 
+    batch_sizes = _parse_int_list(args.batch_sizes)
+
     if args.prompt_embeds:
-        data = np.load(args.prompt_embeds, allow_pickle=False)
-        pos_ctx_raw = data["pos_context"][:1]
-        pos_mask_raw = data["pos_txtmask"][:1].astype(bool)
+        with np.load(args.prompt_embeds, allow_pickle=False) as data:
+            expected_bs = batch_sizes[0] if len(batch_sizes) == 1 else 1
+            cached = _load_cached_prompt_embeds(data, num_images=expected_bs, do_cfg=False)
+        pos_ctx_raw = cached["pos_context"]
+        pos_mask_raw = cached["pos_txtmask"]
     elif args.synthetic_embeds:
         rng = np.random.default_rng(0)
         pos_ctx_raw = rng.standard_normal((1, 512, 12, 2560)).astype(np.float32) * 0.1
@@ -813,7 +922,6 @@ def run_bench(args) -> dict[str, Any]:
     attn_impls = [x.strip() for x in args.attn_impls.split(",") if x.strip()]
     splash_cfgs = _parse_splash_configs(args.splash_configs, args.splash_tiles)
     mask_modes = [x.strip() for x in args.splash_mask_modes.split(",") if x.strip()]
-    batch_sizes = _parse_int_list(args.batch_sizes)
     scan_unrolls = _parse_int_list(args.scan_unrolls)
     resolutions = []
     for item in args.resolutions.split(","):
@@ -982,9 +1090,10 @@ def run_microbench(args) -> dict[str, Any]:
     from tpu_jax.scheduler import roundup
     from tpu_jax.weights import release_tpu_pytree
 
-    dev0, _mesh, active_devs = _configure_jax(args)
+    dev0, _mesh, _active_devs = _configure_jax(args)
     device_kind = getattr(dev0, "device_kind", str(dev0))
-    peak_tflops = _tpu_peak_bf16_tflops(device_kind, len(active_devs))
+    # All microbench tensors are placed on a single chip (dev0), so MFU uses 1-chip peak.
+    peak_tflops = _tpu_peak_bf16_tflops(device_kind, 1)
     cfg = Krea2DiTConfig()
 
     d = cfg.features
@@ -1146,6 +1255,7 @@ def run_microbench(args) -> dict[str, Any]:
     summary = {
         "jax_version": jax.__version__,
         "device_kind": device_kind,
+        "microbench_devices": 1,
         "peak_bf16_tflops": peak_tflops,
         "results": results,
     }

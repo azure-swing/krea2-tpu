@@ -475,26 +475,114 @@ class TestRunnerAndSplashHelpers(unittest.TestCase):
 
     @unittest.skipUnless(HAS_JAX, "JAX is not installed in this environment")
     def test_splash_helpers_and_static_mask_builder(self):
+        import time
+        from jax.experimental.pallas.ops.tpu.splash_attention import (
+            splash_attention_kernel,
+            splash_attention_mask,
+        )
         from tpu_jax.dit import _build_static_splash_mask, _resolve_splash_block_sizes
 
         self.assertEqual(_resolve_splash_block_sizes(4352, 512, 1024, 512), (512, 1024, 512, 4608, 5120))
         self.assertEqual(_resolve_splash_block_sizes(16640, 1024, 2048, 512), (1024, 2048, 512, 17408, 18432))
 
-        class _FakeMaskMod:
-            @staticmethod
-            def FullMask(shape):
-                return ("full", shape)
+        mask = _build_static_splash_mask(512, 1024, 420, splash_attention_mask)
+        self.assertEqual(mask.shape, (512, 1024))
+        self.assertTrue(bool(mask[0:512, 0:420].all()))
+        self.assertFalse(bool(mask[0:512, 420:1024].any()))
+        partial_blk = mask[0:128, 384:512]
+        self.assertEqual(partial_blk.shape, (128, 128))
+        self.assertTrue(bool(partial_blk[:, :36].all()))
+        self.assertFalse(bool(partial_blk[:, 36:].any()))
+        self.assertEqual(
+            hash(mask),
+            hash(_build_static_splash_mask(512, 1024, 420, splash_attention_mask)),
+        )
+        self.assertEqual(
+            _build_static_splash_mask(512, 512, 512, splash_attention_mask),
+            splash_attention_mask.FullMask((512, 512)),
+        )
 
-            @staticmethod
-            def NumpyMask(arr):
-                return ("numpy", arr)
+        # Regression test (Issue #1 P2): 2048x2048 batch-4 (192 heads, 17408x17408) lazy prefix
+        # mask + SplashAttention kernel construction must be fast (was ~83s with dense NumpyMask).
+        t0 = time.perf_counter()
+        big_mask = _build_static_splash_mask(17408, 17408, 16437, splash_attention_mask)
+        mh_mask = splash_attention_mask.MultiHeadMask([big_mask for _ in range(192)])
+        block_sizes = splash_attention_kernel.BlockSizes(
+            block_q=1024, block_kv=1024, block_kv_compute=512
+        )
+        _kernel = splash_attention_kernel.make_splash_mha(
+            mask=mh_mask, head_shards=1, q_seq_shards=1, block_sizes=block_sizes
+        )
+        elapsed = time.perf_counter() - t0
+        self.assertLess(elapsed, 5.0, f"Lazy static Splash mask construction too slow: {elapsed:.2f}s")
 
-        kind, arr = _build_static_splash_mask(512, 1024, 420, _FakeMaskMod)
-        self.assertEqual(kind, "numpy")
-        self.assertEqual(arr.shape, (512, 1024))
-        self.assertTrue(bool(arr[:, :420].all()))
-        self.assertFalse(bool(arr[:, 420:].any()))
-        self.assertEqual(_build_static_splash_mask(512, 512, 512, _FakeMaskMod), ("full", (512, 512)))
+    def test_cached_prompt_embeds_preserves_per_image_rows_and_validates(self):
+        from tpu_jax.run_jax import _load_cached_prompt_embeds
+
+        pos_ctx = np.arange(2 * 8 * 4 * 16, dtype=np.float32).reshape(2, 8, 4, 16)
+        pos_mask = np.array([[1, 1, 1, 0, 0, 1, 1, 1], [1, 1, 1, 1, 1, 0, 1, 1]], dtype=np.bool_)
+        neg_ctx = np.zeros((1, 8, 4, 16), dtype=np.float32)
+        neg_mask = np.array([[1, 0, 0, 0, 0, 1, 1, 1]], dtype=np.bool_)
+        payload = {
+            "pos_context": pos_ctx,
+            "pos_txtmask": pos_mask,
+            "neg_context": neg_ctx,
+            "neg_txtmask": neg_mask,
+        }
+
+        # Both distinct rows preserved for num_images=2 (and singleton neg allowed for CFG)
+        loaded = _load_cached_prompt_embeds(payload, num_images=2, do_cfg=True)
+        np.testing.assert_array_equal(loaded["pos_context"], pos_ctx)
+        np.testing.assert_array_equal(loaded["pos_txtmask"], pos_mask)
+        self.assertEqual(loaded["neg_context"].shape[0], 1)
+
+        # Mismatched batch (2 cached rows with num_images=4) must raise instead of silently slicing
+        with self.assertRaises(ValueError):
+            _load_cached_prompt_embeds(payload, num_images=4, do_cfg=False)
+
+        # Missing negative keys when do_cfg=True must raise
+        with self.assertRaises(ValueError):
+            _load_cached_prompt_embeds(
+                {"pos_context": pos_ctx[:1], "pos_txtmask": pos_mask[:1]}, num_images=2, do_cfg=True
+            )
+
+    @unittest.skipUnless(HAS_JAX, "JAX is not installed in this environment")
+    def test_infer_and_validate_tp_size_from_sharding(self):
+        from types import SimpleNamespace
+        from tpu_jax.dit import infer_and_validate_tp_size
+
+        class _FakeSharding:
+            def __init__(self, shards_by_axis):
+                self._s = shards_by_axis
+
+            def shard_shape(self, shape):
+                return tuple(dim // self._s.get(i, 1) for i, dim in enumerate(shape))
+
+        fake_arr = lambda shape, sh: SimpleNamespace(shape=shape, sharding=_FakeSharding(sh))
+        tp2_params = {
+            "blocks": {
+                "qkvgate_w": fake_arr((2, 64, 192), {2: 2}),
+                "mlp_gate_up_w": fake_arr((2, 64, 256), {2: 2}),
+                "wo_w": fake_arr((2, 64, 64), {1: 2}),
+                "mlp_down_w": fake_arr((2, 128, 64), {1: 2}),
+            }
+        }
+        # Auto-inference returns 2 when tp_size=None
+        self.assertEqual(infer_and_validate_tp_size(tp2_params, None), 2)
+        self.assertEqual(infer_and_validate_tp_size(tp2_params, 2), 2)
+        # Explicit mismatch raises instead of silently corrupting outputs
+        with self.assertRaises(ValueError):
+            infer_and_validate_tp_size(tp2_params, 1)
+
+        # Inconsistent sharding across weights raises
+        bad_params = {
+            "blocks": {
+                "qkvgate_w": fake_arr((2, 64, 192), {2: 2}),
+                "wo_w": fake_arr((2, 64, 64), {}),
+            }
+        }
+        with self.assertRaises(ValueError):
+            infer_and_validate_tp_size(bad_params, None)
 
 
 @unittest.skipUnless(HAS_JAX, "JAX is not installed in this environment")
