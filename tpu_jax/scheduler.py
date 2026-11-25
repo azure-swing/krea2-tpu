@@ -57,6 +57,8 @@ def estimate_step_tflops(
     height: int,
     txt_len: int = 512,
     pad_multiple: int = 256,
+    attn_q_len: int | None = None,
+    attn_kv_len: int | None = None,
     batch_size: int = 1,
     do_cfg: bool = False,
 ) -> float:
@@ -66,6 +68,8 @@ def estimate_step_tflops(
     w_tok = roundup(width, align) // align
     raw_seq = txt_len + h_tok * w_tok
     seq_len = roundup(raw_seq, pad_multiple)
+    q_len = seq_len if attn_q_len is None else int(attn_q_len)
+    kv_len = seq_len if attn_kv_len is None else int(attn_kv_len)
 
     d = config.features
     kv_d = config.kvheads * config.head_dim
@@ -76,8 +80,8 @@ def estimate_step_tflops(
     proj_flops = 2.0 * seq_len * d * (3 * d + 2 * kv_d)
     # SwiGLU MLP: gate (d->mlp_d), up (d->mlp_d), down (mlp_d->d)
     mlp_flops = 6.0 * seq_len * d * mlp_d
-    # Attention QK^T + AV: 4 * S^2 * d
-    attn_flops = 4.0 * seq_len * seq_len * d
+    # Attention QK^T + AV: 4 * q_len * kv_len * d
+    attn_flops = 4.0 * q_len * kv_len * d
 
     per_pass = config.layers * (proj_flops + mlp_flops + attn_flops)
     passes = batch_size * (2 if do_cfg else 1)

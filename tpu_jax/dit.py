@@ -2,35 +2,34 @@
 
 Performance optimizations tailored for Google Cloud TPU (v6e / v5e / v5p):
 1. Hoists ``txtfusion`` (4 transformer blocks), ``txtmlp``, sequence padding, and
-   3D axial RoPE (cos/sin) ONCE outside the denoising loop (official PyTorch
-   recomputes them on every step).
+   3D axial RoPE (cos/sin) ONCE outside the denoising loop (and broadcasts across
+   ``batch > 1`` for multi-seed Midjourney-style batch generation).
 2. Full-graph ``jax.jit`` across the entire N-step Euler ODE loop via
    ``jax.lax.fori_loop`` with buffer donation (zero host syncs, zero Python
    dispatch bubbles).
-3. ``jax.lax.scan`` over all 28 stacked ``SingleStreamBlock`` layers (compiles
-   1 block body instead of 28 unrolled copies; faster compile + better XLA
-   instruction/VMEM scheduling).
-4. Load-time fused & pre-transposed MXU GEMMs:
-   - Single ``qkvgate_w`` ``[6144, 15360]`` replacing 4 separate projections.
-   - Single ``mlp_gate_up_w`` ``[6144, 32768]`` replacing 2 separate projections.
-   - Pre-folded ``scale + 1.0`` RMSNorm weights in FP32.
-5. Zero-copy 4:1 GQA attention backends:
-   - ``splash``: Native TPU Pallas SplashAttention (native 48Q/12KV GQA, zero
-     KV expansion in HBM, ``SegmentIds`` masking, zero O(S^2) materialization,
-     critical for 2048x2048).
-   - ``flash``: Native TPU Pallas FlashAttention.
-   - ``xla``: ``jax.nn.dot_product_attention(..., implementation="xla")`` (native GQA).
-   - ``einsum``: Exact FP32 reference for CPU/TPU parity testing.
-6. Pre-pads the joint sequence ONCE before ``lax.scan`` to a multiple of
-   ``max(256, block_size)`` so per-block attention incurs zero pad/slice overhead
-   (note 1024x1024 -> 4608 = 9*512 and 2048x2048 -> 16896 = 33*512 need zero
-   extra padding for ``block_size=512``).
-7. Optional 1D Tensor Parallelism via ``jax.sharding.Mesh`` across TPU chips.
+3. ``jax.lax.scan`` over all 28 stacked ``SingleStreamBlock`` layers with
+   configurable ``unroll`` to let XLA Latency Hiding Scheduler overlap weight
+   DMA prefetching with compute.
+4. TPU-aligned load-time fused & pre-transposed MXU GEMMs (zero stride-2 lane shuffles):
+   - Contiguous per-shard ``qkvgate_w`` (``[Q | K | V | Gate]`` on 1 chip).
+   - Contiguous per-shard ``mlp_gate_up_w`` (``[Gate | Up]``, eliminating minor-dim
+     stride-2 de-interleave).
+   - Pre-permuted ``[even | odd]`` Q/K head channels for contiguous half-split RoPE.
+   - Pre-folded ``scale + 1.0`` RMSNorm and ``1 / sqrt(head_dim)`` folded into ``qnorm``.
+   - Fused FP32 ``_modulated_rms_norm`` avoiding redundant BF16 roundtrips.
+5. Text token compaction + image-first ``[img | valid_txt | pad]`` layout:
+   - Compacts valid text tokens into small buckets (e.g. 64/128/256/512), cutting
+     dead text tokens from all 28 layers' GEMMs and attention.
+   - Places aligned image tokens first so 94-97% of SplashAttention tiles are
+     compile-time ``FULL`` (zero VPU ``SegmentIds`` mask overhead when using static
+     masks).
+6. Decoupled GEMM alignment (multiple of 256 for v6e 256x256 MXU) and asymmetric
+   Pallas SplashAttention tiling (``block_q``, ``block_kv``, ``block_kv_compute``)
+   with single-launch merged-head batching for shared-prompt ``batch > 1``.
 """
 
 from __future__ import annotations
 
-import math
 from functools import partial
 from typing import Any
 
@@ -50,6 +49,22 @@ def _rms_norm(x: jnp.ndarray, weight: jnp.ndarray, eps: float = 1e-5) -> jnp.nda
     x_f32 = x.astype(jnp.float32)
     inv_rms = lax.rsqrt(jnp.mean(x_f32 * x_f32, axis=-1, keepdims=True) + jnp.float32(eps))
     return (x_f32 * inv_rms * weight.astype(jnp.float32)).astype(x.dtype)
+
+
+def _modulated_rms_norm(
+    x: jnp.ndarray,
+    weight: jnp.ndarray,
+    scale: jnp.ndarray,
+    shift: jnp.ndarray,
+    eps: float = 1e-5,
+    out_dtype: Any | None = None,
+) -> jnp.ndarray:
+    """Fused FP32 RMSNorm + AdaLN modulation ``(1 + scale) * rms_norm(x) + shift``."""
+    x_f32 = x.astype(jnp.float32)
+    inv_rms = lax.rsqrt(jnp.mean(x_f32 * x_f32, axis=-1, keepdims=True) + jnp.float32(eps))
+    normed = x_f32 * inv_rms * weight.astype(jnp.float32)
+    out = (jnp.float32(1.0) + scale.astype(jnp.float32)) * normed + shift.astype(jnp.float32)
+    return out.astype(x.dtype if out_dtype is None else out_dtype)
 
 
 def _matmul(x: jnp.ndarray, w: jnp.ndarray, scale: jnp.ndarray | None = None) -> jnp.ndarray:
@@ -95,16 +110,17 @@ def compute_rope_cos_sin(
 
 
 def _apply_rope(x: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray) -> jnp.ndarray:
-    """Apply interleaved pair RoPE to ``x [B, S, H, D]`` using FP32 ``cos, sin [B, S, D//2]``."""
+    """Apply contiguous half-split RoPE to ``x [B, S, H, D]`` (weights pre-permuted ``[even|odd]``)."""
     orig_dtype = x.dtype
+    half = x.shape[-1] // 2
     x_f32 = x.astype(jnp.float32)
-    x0 = x_f32[..., 0::2]
-    x1 = x_f32[..., 1::2]
+    x0 = x_f32[..., :half]
+    x1 = x_f32[..., half:]
     c = cos[:, :, None, :]
     s = sin[:, :, None, :]
     y0 = x0 * c - x1 * s
     y1 = x0 * s + x1 * c
-    return jnp.stack([y0, y1], axis=-1).reshape(x.shape).astype(orig_dtype)
+    return jnp.concatenate([y0, y1], axis=-1).astype(orig_dtype)
 
 
 def _temb(
@@ -115,73 +131,205 @@ def _temb(
     tfactor: float = 1000.0,
     out_dtype: Any = jnp.bfloat16,
 ) -> jnp.ndarray:
-    """Exact match to ``mmdit.temb``: returns ``[B, 1, dim]`` with ``cat(cos, sin)``."""
+    """Exact match to ``mmdit.temb``: returns ``[B_t, 1, dim]`` with ``cat(cos, sin)``."""
     args = (t.astype(jnp.float32) * jnp.float32(tfactor))[:, None, None] * time_freqs[None, None, :]
     return jnp.concatenate([jnp.cos(args), jnp.sin(args)], axis=-1).astype(out_dtype)
 
 
-def _splash_attention_single(
+def compact_text_embeddings(
+    context: np.ndarray,
+    txtmask: np.ndarray,
+    *,
+    buckets: tuple[int, ...] = (64, 128, 256, 512),
+    exact: bool = False,
+) -> tuple[np.ndarray, np.ndarray, int | None]:
+    """Compact valid text tokens to the front and pad to a small static bucket length.
+
+    Valid for Krea 2 because:
+    - ``TextFusionTransformer`` has no positional encoding or causal mask (only ``txtmask``).
+    - All text tokens in ``SingleStreamDiT`` share identical 3D RoPE position ``(0, 0, 0)``.
+
+    Returns:
+        ``(ctx_compact, mask_compact, common_valid_len)`` where ``common_valid_len`` is the
+        exact number of valid text tokens if every batch item has the same count, else ``None``.
+    """
+    mask_bool = np.asarray(txtmask, dtype=np.bool_)
+    batch, orig_len = mask_bool.shape
+    valid_indices = [np.flatnonzero(mask_bool[b]) for b in range(batch)]
+    counts = [int(len(idx)) for idx in valid_indices]
+    max_valid = max(1, max(counts))
+
+    if exact:
+        target_len = min(orig_len, max_valid)
+    else:
+        sorted_buckets = sorted(int(b) for b in buckets if int(b) > 0)
+        target_len = next((b for b in sorted_buckets if b >= max_valid), orig_len)
+        target_len = min(orig_len, target_len)
+
+    ctx_out = np.zeros((batch, target_len, *context.shape[2:]), dtype=context.dtype)
+    mask_out = np.zeros((batch, target_len), dtype=np.bool_)
+    for b, idx in enumerate(valid_indices):
+        n = min(len(idx), target_len)
+        if n > 0:
+            ctx_out[b, :n] = context[b, idx[:n]]
+            mask_out[b, :n] = True
+
+    common_valid_len = counts[0] if (len(set(counts)) == 1 and counts[0] <= target_len) else None
+    return ctx_out, mask_out, common_valid_len
+
+
+def _resolve_splash_block_sizes(
+    seq_len: int,
+    block_q: int,
+    block_kv: int,
+    block_kv_compute: int,
+) -> tuple[int, int, int, int, int]:
+    """Resolve TPU-valid (128-aligned) asymmetric SplashAttention block sizes and padded lengths."""
+    max_blk = max(128, roundup(seq_len, 128))
+    eff_bq = min(max(128, (int(block_q) // 128) * 128), max_blk)
+    eff_bkv = min(max(128, (int(block_kv) // 128) * 128), max_blk)
+    eff_bkvc = min(max(128, (int(block_kv_compute) // 128) * 128), eff_bkv)
+    while eff_bkv % eff_bkvc != 0 and eff_bkvc > 128:
+        eff_bkvc -= 128
+    q_padded = roundup(seq_len, eff_bq)
+    kv_padded = roundup(seq_len, eff_bkv)
+    return eff_bq, eff_bkv, eff_bkvc, q_padded, kv_padded
+
+
+def _build_static_splash_mask(
+    q_padded: int,
+    kv_padded: int,
+    valid_len: int,
+    splash_attention_mask: Any,
+) -> Any:
+    """Build compile-time static mask for contiguous valid prefix ``[0, valid_len)``.
+
+    Every block with ``kv_end <= valid_len`` compiles as ``FULL`` (zero VPU mask ops);
+    every block with ``kv_start >= valid_len`` compiles as ``EMPTY`` (skipped); and
+    setting ``m[:, :valid_len] = True`` ensures no padded query row is all-False (zero NaN risk).
+    """
+    if valid_len >= kv_padded:
+        return splash_attention_mask.FullMask((q_padded, kv_padded))
+    m_np = np.zeros((q_padded, kv_padded), dtype=np.bool_)
+    m_np[:, :valid_len] = True
+    return splash_attention_mask.NumpyMask(m_np)
+
+
+def _splash_attention(
     q: jnp.ndarray,
     k: jnp.ndarray,
     v: jnp.ndarray,
-    valid_mask_1d: jnp.ndarray | None,
+    valid_mask: jnp.ndarray | None,
     *,
-    block_size: int = 512,
+    block_q: int = 512,
+    block_kv: int = 1024,
+    block_kv_compute: int = 512,
+    static_valid_len: int | None = None,
 ) -> jnp.ndarray:
-    """Single-batch native GQA Pallas SplashAttention on ``[S, H_q, D]``, ``[S, H_kv, D]``."""
+    """Native GQA Pallas SplashAttention on ``[B, S, H_q, D]``, ``[B, S, H_kv, D]``.
+
+    Note: ``q`` already has ``1 / sqrt(head_dim)`` pre-folded into ``qnorm``.
+    Supports:
+    - Asymmetric ``(block_q, block_kv, block_kv_compute)`` independent of GEMM sequence padding.
+    - Compile-time static ``NumpyMask`` (``segment_ids=None``) when ``static_valid_len`` is given,
+      eliminating per-tile VPU ``SegmentIds`` masking across 94-97% of image-to-image tiles.
+    - Single-launch head-merged batching (``[B * H_q, S, D]``) when batch elements share a mask
+      (e.g., Midjourney-style multi-seed batch generation), and ``jax.vmap`` otherwise.
+    """
     from jax.experimental.pallas.ops.tpu.splash_attention import (
         splash_attention_kernel,
         splash_attention_mask,
     )
 
-    seq_len, num_q_heads, head_dim = q.shape
-    eff_block = min(block_size, max(128, ((seq_len + 127) // 128) * 128))
-    padded_len = ((seq_len + eff_block - 1) // eff_block) * eff_block
-    pad = padded_len - seq_len
-
-    # SplashAttention expects [H, S, D] and does NOT scale Q internally.
-    scale = jnp.float32(1.0 / math.sqrt(head_dim))
-    q_h = (jnp.transpose(q, (1, 0, 2)).astype(jnp.float32) * scale).astype(q.dtype)
-    k_h = jnp.transpose(k, (1, 0, 2))
-    v_h = jnp.transpose(v, (1, 0, 2))
-
-    if pad > 0:
-        q_h = jnp.pad(q_h, ((0, 0), (0, pad), (0, 0)))
-        k_h = jnp.pad(k_h, ((0, 0), (0, pad), (0, 0)))
-        v_h = jnp.pad(v_h, ((0, 0), (0, pad), (0, 0)))
-        if valid_mask_1d is not None:
-            valid_padded = jnp.pad(valid_mask_1d, ((0, pad),), constant_values=False)
-        else:
-            valid_padded = jnp.pad(
-                jnp.ones((seq_len,), dtype=jnp.bool_), ((0, pad),), constant_values=False
-            )
-    else:
-        valid_padded = valid_mask_1d
-
-    if valid_padded is not None:
-        seg_val = valid_padded.astype(jnp.int32)
-        seg_ids = splash_attention_kernel.SegmentIds(q=seg_val, kv=seg_val)
-    else:
-        seg_ids = None
-
-    mask = splash_attention_mask.MultiHeadMask(
-        [splash_attention_mask.FullMask((padded_len, padded_len)) for _ in range(num_q_heads)]
+    batch, seq_len, num_q_heads, head_dim = q.shape
+    num_kv_heads = k.shape[2]
+    eff_bq, eff_bkv, eff_bkvc, q_padded, kv_padded = _resolve_splash_block_sizes(
+        seq_len, block_q, block_kv, block_kv_compute
     )
+    q_pad = q_padded - seq_len
+    kv_pad = kv_padded - seq_len
+
     block_sizes = splash_attention_kernel.BlockSizes(
-        block_q=min(eff_block, padded_len),
-        block_kv=min(eff_block, padded_len),
-        block_kv_compute=min(eff_block, padded_len),
+        block_q=eff_bq,
+        block_kv=eff_bkv,
+        block_kv_compute=eff_bkvc,
     )
+
+    use_static_mask = (static_valid_len is not None) or (valid_mask is None)
+    shared_mask = (batch == 1) or use_static_mask or (valid_mask is not None and valid_mask.shape[0] == 1)
+
+    if use_static_mask:
+        eff_valid = int(static_valid_len) if static_valid_len is not None else seq_len
+        base_mask = _build_static_splash_mask(q_padded, kv_padded, eff_valid, splash_attention_mask)
+    else:
+        base_mask = splash_attention_mask.FullMask((q_padded, kv_padded))
+
+    if shared_mask:
+        # Merge batch into head dimension: (b * H_q + hq) // G == b * H_kv + (hq // G), exact 4:1 GQA!
+        q_bh = jnp.transpose(q, (0, 2, 1, 3)).reshape(batch * num_q_heads, seq_len, head_dim)
+        k_bh = jnp.transpose(k, (0, 2, 1, 3)).reshape(batch * num_kv_heads, seq_len, head_dim)
+        v_bh = jnp.transpose(v, (0, 2, 1, 3)).reshape(batch * num_kv_heads, seq_len, head_dim)
+        if q_pad > 0:
+            q_bh = jnp.pad(q_bh, ((0, 0), (0, q_pad), (0, 0)))
+        if kv_pad > 0:
+            k_bh = jnp.pad(k_bh, ((0, 0), (0, kv_pad), (0, 0)))
+            v_bh = jnp.pad(v_bh, ((0, 0), (0, kv_pad), (0, 0)))
+
+        if use_static_mask:
+            seg_ids = None
+        else:
+            assert valid_mask is not None
+            vm = valid_mask[0]
+            q_seg = (jnp.pad(vm, ((0, q_pad),), constant_values=False) if q_pad > 0 else vm).astype(jnp.int32)
+            kv_seg = (jnp.pad(vm, ((0, kv_pad),), constant_values=False) if kv_pad > 0 else vm).astype(jnp.int32)
+            seg_ids = splash_attention_kernel.SegmentIds(q=q_seg, kv=kv_seg)
+
+        mask = splash_attention_mask.MultiHeadMask([base_mask for _ in range(batch * num_q_heads)])
+        kernel = splash_attention_kernel.make_splash_mha(
+            mask=mask,
+            head_shards=1,
+            q_seq_shards=1,
+            block_sizes=block_sizes,
+        )
+        out_bh = kernel(q_bh, k_bh, v_bh, segment_ids=seg_ids)
+        if q_pad > 0:
+            out_bh = out_bh[:, :seq_len, :]
+        out = out_bh.reshape(batch, num_q_heads, seq_len, head_dim)
+        return jnp.transpose(out, (0, 2, 1, 3)).astype(v.dtype)
+
+    # Heterogeneous masks across batch elements -> vmap a single kernel over batch.
+    assert valid_mask is not None
+    q_bhsd = jnp.transpose(q, (0, 2, 1, 3))
+    k_bhsd = jnp.transpose(k, (0, 2, 1, 3))
+    v_bhsd = jnp.transpose(v, (0, 2, 1, 3))
+    if q_pad > 0:
+        q_bhsd = jnp.pad(q_bhsd, ((0, 0), (0, 0), (0, q_pad), (0, 0)))
+    if kv_pad > 0:
+        k_bhsd = jnp.pad(k_bhsd, ((0, 0), (0, 0), (0, kv_pad), (0, 0)))
+        v_bhsd = jnp.pad(v_bhsd, ((0, 0), (0, 0), (0, kv_pad), (0, 0)))
+
+    q_seg_2d = (
+        jnp.pad(valid_mask, ((0, 0), (0, q_pad)), constant_values=False) if q_pad > 0 else valid_mask
+    ).astype(jnp.int32)
+    kv_seg_2d = (
+        jnp.pad(valid_mask, ((0, 0), (0, kv_pad)), constant_values=False) if kv_pad > 0 else valid_mask
+    ).astype(jnp.int32)
+    seg_ids_2d = splash_attention_kernel.SegmentIds(q=q_seg_2d, kv=kv_seg_2d)
+
+    mask = splash_attention_mask.MultiHeadMask([base_mask for _ in range(num_q_heads)])
     kernel = splash_attention_kernel.make_splash_mha(
         mask=mask,
         head_shards=1,
         q_seq_shards=1,
         block_sizes=block_sizes,
     )
-    out_h = kernel(q_h, k_h, v_h, segment_ids=seg_ids)
-    if pad > 0:
-        out_h = out_h[:, :seq_len, :]
-    return jnp.transpose(out_h, (1, 0, 2)).astype(v.dtype)
+    out_bhsd = jax.vmap(
+        kernel,
+        in_axes=(0, 0, 0, splash_attention_kernel.SegmentIds(0, 0)),
+    )(q_bhsd, k_bhsd, v_bhsd, seg_ids_2d)
+    if q_pad > 0:
+        out_bhsd = out_bhsd[:, :, :seq_len, :]
+    return jnp.transpose(out_bhsd, (0, 2, 1, 3)).astype(v.dtype)
 
 
 def _pallas_flash_attention(
@@ -190,18 +338,20 @@ def _pallas_flash_attention(
     v: jnp.ndarray,
     valid_mask: jnp.ndarray | None,
     *,
-    block_size: int = 512,
+    block_q: int = 512,
+    block_kv: int = 512,
 ) -> jnp.ndarray:
-    """TPU Pallas FlashAttention on ``[B, S, H_q, D]``, ``[B, S, H_kv, D]``."""
+    """TPU Pallas FlashAttention on ``[B, S, H_q, D]``, ``[B, S, H_kv, D]`` (Q pre-scaled)."""
     from jax.experimental.pallas.ops.tpu import flash_attention as pallas_fa
 
-    batch, seq_len, num_q_heads, head_dim = q.shape
+    batch, seq_len, num_q_heads, _ = q.shape
     num_kv_heads = k.shape[2]
-    eff_block = min(block_size, max(128, ((seq_len + 127) // 128) * 128))
-    padded_len = ((seq_len + eff_block - 1) // eff_block) * eff_block
+    eff_bq, eff_bkv, _, q_padded, kv_padded = _resolve_splash_block_sizes(seq_len, block_q, block_kv, block_kv)
+    eff_block = min(eff_bq, eff_bkv)
+    padded_len = max(q_padded, kv_padded)
+    padded_len = roundup(padded_len, eff_block)
     pad = padded_len - seq_len
 
-    # Pallas flash_attention expects [B, H, S, D] with matching H across Q/K/V.
     q_bhsd = jnp.transpose(q, (0, 2, 1, 3))
     k_bhsd = jnp.transpose(k, (0, 2, 1, 3))
     v_bhsd = jnp.transpose(v, (0, 2, 1, 3))
@@ -215,13 +365,14 @@ def _pallas_flash_attention(
         k_bhsd = jnp.pad(k_bhsd, ((0, 0), (0, 0), (0, pad), (0, 0)))
         v_bhsd = jnp.pad(v_bhsd, ((0, 0), (0, 0), (0, pad), (0, 0)))
         if valid_mask is not None:
-            valid_padded = jnp.pad(valid_mask, ((0, 0), (0, pad)), constant_values=False)
+            vm = jnp.broadcast_to(valid_mask, (batch, seq_len))
+            valid_padded = jnp.pad(vm, ((0, 0), (0, pad)), constant_values=False)
         else:
             valid_padded = jnp.pad(
                 jnp.ones((batch, seq_len), dtype=jnp.bool_), ((0, 0), (0, pad)), constant_values=False
             )
     else:
-        valid_padded = valid_mask
+        valid_padded = jnp.broadcast_to(valid_mask, (batch, seq_len)) if valid_mask is not None else None
 
     if valid_padded is not None:
         seg_val = valid_padded.astype(jnp.int32)
@@ -240,7 +391,7 @@ def _pallas_flash_attention(
         k_bhsd,
         v_bhsd,
         segment_ids=seg_ids,
-        sm_scale=1.0 / math.sqrt(head_dim),
+        sm_scale=1.0,
         block_sizes=block_sizes,
     )
     if pad > 0:
@@ -255,47 +406,51 @@ def _gqa_attention(
     valid_mask: jnp.ndarray | None,
     *,
     attn_impl: str = "splash",
-    splash_block_size: int = 512,
+    splash_block_q: int = 512,
+    splash_block_kv: int = 1024,
+    splash_block_kv_compute: int = 512,
+    static_valid_len: int | None = None,
 ) -> jnp.ndarray:
-    """Multi-head / Grouped-Query Attention: ``[B, S, H_q, D]`` -> ``[B, S, H_q * D]``."""
+    """Multi-head / Grouped-Query Attention: ``[B, S, H_q, D]`` -> ``[B, S, H_q * D]`` (Q pre-scaled)."""
     batch, seq_len, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[2]
     out_dim = num_q_heads * head_dim
 
     if attn_impl == "splash":
-        if batch == 1:
-            vm0 = valid_mask[0] if valid_mask is not None else None
-            out = _splash_attention_single(q[0], k[0], v[0], vm0, block_size=splash_block_size)[None, ...]
-        else:
-            outs = [
-                _splash_attention_single(
-                    q[b],
-                    k[b],
-                    v[b],
-                    valid_mask[b] if valid_mask is not None else None,
-                    block_size=splash_block_size,
-                )
-                for b in range(batch)
-            ]
-            out = jnp.stack(outs, axis=0)
+        out = _splash_attention(
+            q,
+            k,
+            v,
+            valid_mask,
+            block_q=splash_block_q,
+            block_kv=splash_block_kv,
+            block_kv_compute=splash_block_kv_compute,
+            static_valid_len=static_valid_len,
+        )
         return out.reshape(batch, seq_len, out_dim)
 
     if attn_impl == "flash":
-        out = _pallas_flash_attention(q, k, v, valid_mask, block_size=splash_block_size)
+        out = _pallas_flash_attention(
+            q,
+            k,
+            v,
+            valid_mask,
+            block_q=splash_block_q,
+            block_kv=splash_block_kv,
+        )
         return out.reshape(batch, seq_len, out_dim)
 
     if attn_impl == "xla":
         mask_4d = valid_mask[:, None, None, :] if valid_mask is not None else None
-        out = jax.nn.dot_product_attention(q, k, v, mask=mask_4d, implementation="xla")
+        out = jax.nn.dot_product_attention(q, k, v, mask=mask_4d, scale=1.0, implementation="xla")
         return out.astype(v.dtype).reshape(batch, seq_len, out_dim)
 
     if attn_impl == "einsum":
         group_size = num_q_heads // num_kv_heads
-        scale = jnp.float32(1.0 / math.sqrt(head_dim))
         q_g = q.astype(jnp.float32).reshape(batch, seq_len, num_kv_heads, group_size, head_dim)
         k_f = k.astype(jnp.float32)
         v_f = v.astype(jnp.float32)
-        logits = jnp.einsum("bskgd,btkd->bkgst", q_g, k_f) * scale
+        logits = jnp.einsum("bskgd,btkd->bkgst", q_g, k_f)
         if valid_mask is not None:
             logits = jnp.where(valid_mask[:, None, None, None, :], logits, jnp.float32(-1e30))
         weights = jax.nn.softmax(logits, axis=-1)
@@ -317,26 +472,31 @@ def _attention_block_op(
     head_dim: int,
     norm_eps: float,
     attn_impl: str,
-    splash_block_size: int,
+    splash_block_q: int,
+    splash_block_kv: int,
+    splash_block_kv_compute: int,
+    static_valid_len: int | None = None,
+    tp_size: int = 1,
 ) -> jnp.ndarray:
-    """Fused KV-grouped QKVGate -> QK-Norm -> RoPE -> GQA -> Sigmoid-Gate -> Output Proj.
-
-    ``block["qkvgate_w"]`` has shape ``[dim, kv_heads * (2 * group + 2) * head_dim]``
-    organized per KV-head group as ``[Q_group, K, V, Gate_group]``. This runs as a
-    single MXU GEMM on 1 chip AND shards cleanly along ``kv_heads`` for 1D TP.
-    """
+    """Fused contiguous QKVGate -> QK-Norm -> half-split RoPE -> GQA -> Sigmoid-Gate -> Wo."""
     batch, seq_len, _ = y.shape
-    group_size = num_heads // num_kv_heads
-    q_g = group_size * head_dim
-    per_kv = 2 * q_g + 2 * head_dim
-
-    qkvg = _matmul(y, block["qkvgate_w"], block.get("qkvgate_s")).reshape(
-        batch, seq_len, num_kv_heads, per_kv
-    )
-    q = qkvg[..., :q_g].reshape(batch, seq_len, num_heads, head_dim)
-    k = qkvg[..., q_g : q_g + head_dim]
-    v = qkvg[..., q_g + head_dim : q_g + 2 * head_dim]
-    gate = qkvg[..., q_g + 2 * head_dim :].reshape(batch, seq_len, num_heads * head_dim)
+    qkvg = _matmul(y, block["qkvgate_w"], block.get("qkvgate_s"))
+    if tp_size <= 1:
+        q_dim = num_heads * head_dim
+        kv_dim = num_kv_heads * head_dim
+        q = qkvg[..., :q_dim].reshape(batch, seq_len, num_heads, head_dim)
+        k = qkvg[..., q_dim : q_dim + kv_dim].reshape(batch, seq_len, num_kv_heads, head_dim)
+        v = qkvg[..., q_dim + kv_dim : q_dim + 2 * kv_dim].reshape(batch, seq_len, num_kv_heads, head_dim)
+        gate = qkvg[..., q_dim + 2 * kv_dim :]
+    else:
+        q_s = (num_heads // tp_size) * head_dim
+        kv_s = (num_kv_heads // tp_size) * head_dim
+        per_s = 2 * q_s + 2 * kv_s
+        qkvg_s = qkvg.reshape(batch, seq_len, tp_size, per_s)
+        q = qkvg_s[..., :q_s].reshape(batch, seq_len, num_heads, head_dim)
+        k = qkvg_s[..., q_s : q_s + kv_s].reshape(batch, seq_len, num_kv_heads, head_dim)
+        v = qkvg_s[..., q_s + kv_s : q_s + 2 * kv_s].reshape(batch, seq_len, num_kv_heads, head_dim)
+        gate = qkvg_s[..., q_s + 2 * kv_s :].reshape(batch, seq_len, num_heads * head_dim)
 
     q = _rms_norm(q, block["qnorm"], norm_eps)
     k = _rms_norm(k, block["knorm"], norm_eps)
@@ -350,18 +510,24 @@ def _attention_block_op(
         v,
         valid_mask,
         attn_impl=attn_impl,
-        splash_block_size=splash_block_size,
+        splash_block_q=splash_block_q,
+        splash_block_kv=splash_block_kv,
+        splash_block_kv_compute=splash_block_kv_compute,
+        static_valid_len=static_valid_len,
     )
     gated = attn_out * jax.nn.sigmoid(gate)
     return _matmul(gated, block["wo_w"], block.get("wo_s"))
 
 
-def _swiglu_op(y: jnp.ndarray, block: dict[str, jnp.ndarray]) -> jnp.ndarray:
-    """Fused Gate+Up SwiGLU MLP (``mlp_gate_up_w`` shape ``[dim, 2 * mlp_dim]`` paired by col)."""
+def _swiglu_op(y: jnp.ndarray, block: dict[str, jnp.ndarray], *, tp_size: int = 1) -> jnp.ndarray:
+    """Fused contiguous Gate+Up SwiGLU MLP (zero stride-2 minor-dim shuffle)."""
     gu = _matmul(y, block["mlp_gate_up_w"], block.get("mlp_gate_up_s"))
-    gu_paired = gu.reshape(*y.shape[:-1], -1, 2)
-    gate = gu_paired[..., 0]
-    up = gu_paired[..., 1]
+    if tp_size <= 1:
+        gate, up = jnp.split(gu, 2, axis=-1)
+    else:
+        gu_s = gu.reshape(*y.shape[:-1], tp_size, 2, -1)
+        gate = gu_s[..., 0, :].reshape(*y.shape[:-1], -1)
+        up = gu_s[..., 1, :].reshape(*y.shape[:-1], -1)
     return _matmul(jax.nn.silu(gate) * up, block["mlp_down_w"], block.get("mlp_down_s"))
 
 
@@ -376,7 +542,7 @@ def _text_fusion_block_forward(
     norm_eps: float,
     attn_impl: str,
 ) -> jnp.ndarray:
-    # TextFusion runs once per prompt on tiny S (12 or 512); xla/einsum avoids Pallas pad overhead.
+    # TextFusion runs once per prompt on tiny S (12 or <=512); xla/einsum avoids Pallas pad overhead.
     eff_impl = "xla" if attn_impl in ("splash", "flash") else attn_impl
     h = _rms_norm(x, block["prenorm"], norm_eps)
     x = x + _attention_block_op(
@@ -390,10 +556,14 @@ def _text_fusion_block_forward(
         head_dim=head_dim,
         norm_eps=norm_eps,
         attn_impl=eff_impl,
-        splash_block_size=128,
+        splash_block_q=128,
+        splash_block_kv=128,
+        splash_block_kv_compute=128,
+        static_valid_len=None,
+        tp_size=1,
     )
     h = _rms_norm(x, block["postnorm"], norm_eps)
-    return x + _swiglu_op(h, block)
+    return x + _swiglu_op(h, block, tp_size=1)
 
 
 def _single_stream_block_forward(
@@ -409,14 +579,18 @@ def _single_stream_block_forward(
     head_dim: int,
     norm_eps: float,
     attn_impl: str,
-    splash_block_size: int,
+    splash_block_q: int,
+    splash_block_kv: int,
+    splash_block_kv_compute: int,
+    static_valid_len: int | None = None,
+    tp_size: int = 1,
 ) -> jnp.ndarray:
     """Single Krea 2 ``SingleStreamBlock`` forward (``jax.lax.scan`` body)."""
     w_dtype = block["mod_lin"].dtype
     mod_out = tvec + block["mod_lin"][None, None, :]
     prescale, preshift, pregate, postscale, postshift, postgate = jnp.split(mod_out, 6, axis=-1)
 
-    y = ((1.0 + prescale) * _rms_norm(x, block["prenorm"], norm_eps) + preshift).astype(w_dtype)
+    y = _modulated_rms_norm(x, block["prenorm"], prescale, preshift, norm_eps, out_dtype=w_dtype)
     attn_out = _attention_block_op(
         y,
         block,
@@ -428,12 +602,16 @@ def _single_stream_block_forward(
         head_dim=head_dim,
         norm_eps=norm_eps,
         attn_impl=attn_impl,
-        splash_block_size=splash_block_size,
+        splash_block_q=splash_block_q,
+        splash_block_kv=splash_block_kv,
+        splash_block_kv_compute=splash_block_kv_compute,
+        static_valid_len=static_valid_len,
+        tp_size=tp_size,
     )
     x = x + pregate * attn_out
 
-    y = ((1.0 + postscale) * _rms_norm(x, block["postnorm"], norm_eps) + postshift).astype(w_dtype)
-    mlp_out = _swiglu_op(y, block)
+    y = _modulated_rms_norm(x, block["postnorm"], postscale, postshift, norm_eps, out_dtype=w_dtype)
+    mlp_out = _swiglu_op(y, block, tp_size=tp_size)
     return x + postgate * mlp_out
 
 
@@ -445,8 +623,14 @@ def build_positions_and_mask(
     *,
     patch: int = 2,
     pad_multiple: int = 256,
+    img_first: bool = True,
 ) -> tuple[jnp.ndarray, jnp.ndarray, int]:
-    """Build padded ``(pos, valid_mask, pad_len)`` matching ``sampling.prepare`` + ``mmdit.py``."""
+    """Build padded ``(pos, valid_mask, pad_len)`` matching ``sampling.prepare`` + ``mmdit.py``.
+
+    When ``img_first=True`` (default), places aligned image tokens at ``[0, img_len)``
+    followed by text tokens at ``[img_len, img_len + txt_len)`` so the entire image
+    region forms a contiguous valid prefix for static SplashAttention block skipping.
+    """
     h_tok = latent_h // patch
     w_tok = latent_w // patch
     img_len = h_tok * w_tok
@@ -461,10 +645,15 @@ def build_positions_and_mask(
     ).reshape(1, img_len, 3)
     img_pos = jnp.broadcast_to(img_ids, (batch, img_len, 3))
     txt_pos = jnp.zeros((batch, txt_len, 3), dtype=jnp.float32)
-    pos = jnp.concatenate([txt_pos, img_pos], axis=1)
 
     img_mask = jnp.ones((batch, img_len), dtype=jnp.bool_)
-    valid_mask = jnp.concatenate([txtmask.astype(jnp.bool_), img_mask], axis=1)
+    txt_mask_b = txtmask.astype(jnp.bool_)
+    if img_first:
+        pos = jnp.concatenate([img_pos, txt_pos], axis=1)
+        valid_mask = jnp.concatenate([img_mask, txt_mask_b], axis=1)
+    else:
+        pos = jnp.concatenate([txt_pos, img_pos], axis=1)
+        valid_mask = jnp.concatenate([txt_mask_b, img_mask], axis=1)
 
     full_len = txt_len + img_len
     pad_len = (-full_len) % pad_multiple
@@ -484,11 +673,17 @@ def prepare_text_conditioning(
     latent_w: int,
     attn_impl: str = "splash",
     splash_block_size: int = 512,
+    gemm_pad_multiple: int = 256,
+    img_first: bool = True,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, int]:
     """Run TextFusion + TextMLP + RoPE ONCE before the denoising loop.
 
+    Decouples GEMM sequence alignment (``gemm_pad_multiple=256`` for v6e 256x256 MXU)
+    from SplashAttention tile sizes so large attention tiles never waste GEMM FLOPs.
+
     Returns ``(text_tokens, rope_cos, rope_sin, joint_valid_mask, pad_len)``.
     """
+    del splash_block_size  # Kept for API compatibility; GEMM alignment is decoupled.
     w_dtype = params["first_w"].dtype
     b, l_txt, n_layers, d_txt = context.shape
     txtmask_bool = txtmask.astype(jnp.bool_)
@@ -530,10 +725,15 @@ def prepare_text_conditioning(
     x = jax.nn.gelu(x, approximate=True)
     text_tokens = _matmul(x, params["txtmlp_fc2_w"]) + params["txtmlp_fc2_b"]
 
-    # 5. Pre-pad once to a multiple of max(256, splash_block_size) for zero per-block padding.
-    pad_multiple = max(256, splash_block_size) if attn_impl in ("splash", "flash") else 256
+    # 5. Pad GEMM sequence only to 256-aligned MXU boundary (independent of Splash tile size).
     pos, valid_mask, pad_len = build_positions_and_mask(
-        b, latent_h, latent_w, txtmask_bool, patch=config.patch, pad_multiple=pad_multiple
+        b,
+        latent_h,
+        latent_w,
+        txtmask_bool,
+        patch=config.patch,
+        pad_multiple=gemm_pad_multiple,
+        img_first=img_first,
     )
     rope_cos, rope_sin = compute_rope_cos_sin(pos, params["rope_omegas"])
     return text_tokens, rope_cos, rope_sin, valid_mask, pad_len
@@ -552,29 +752,46 @@ def dit_forward_precomputed(
     pad_len: int = 0,
     attn_impl: str = "splash",
     splash_block_size: int = 512,
+    splash_block_q: int | None = None,
+    splash_block_kv: int | None = None,
+    splash_block_kv_compute: int | None = None,
+    static_valid_len: int | None = None,
+    scan_unroll: int = 1,
+    img_first: bool = True,
+    tp_size: int = 1,
 ) -> jnp.ndarray:
     """Single Krea 2 DiT forward pass using precomputed text conditioning and RoPE.
 
-    Args:
-        img_tokens: Patchified latent ``[B, img_len, C * patch^2]``.
-        timestep: Scalar or ``[B]`` float timestep in ``[0, 1]``.
-
-    Returns:
-        Predicted velocity ``[B, img_len, C * patch^2]`` in model dtype.
+    Supports broadcasting ``text_tokens`` / ``rope_cos`` / ``rope_sin`` / ``valid_mask``
+    from batch=1 across ``batch > 1`` ``img_tokens`` (multi-seed batch generation).
     """
     w_dtype = params["first_w"].dtype
     batch, img_len, _ = img_tokens.shape
     txt_len = text_tokens.shape[1]
 
-    # Timestep embedding -> tmlp -> tproj
-    t_b = jnp.broadcast_to(jnp.asarray(timestep, dtype=jnp.float32).reshape(-1), (batch,))
+    bq = splash_block_size if splash_block_q is None else splash_block_q
+    bkv = splash_block_size if splash_block_kv is None else splash_block_kv
+    bkvc = min(bq, bkv) if splash_block_kv_compute is None else splash_block_kv_compute
+
+    # Timestep embedding -> tmlp -> tproj (stays [1, 1, *] when timestep is scalar -> broadcasts over batch)
+    t_arr = jnp.asarray(timestep, dtype=jnp.float32).reshape(-1)
+    t_b = t_arr if t_arr.shape[0] in (1, batch) else jnp.broadcast_to(t_arr, (batch,))
     t_in = _temb(t_b, config.tdim, params["time_freqs"], out_dtype=w_dtype)
     t_h = jax.nn.gelu(_matmul(t_in, params["tmlp_fc1_w"]) + params["tmlp_fc1_b"], approximate=True)
     t_emb = _matmul(t_h, params["tmlp_fc2_w"]) + params["tmlp_fc2_b"]
     tvec = _matmul(jax.nn.gelu(t_emb, approximate=True), params["tproj_w"]) + params["tproj_b"]
 
     img_emb = _matmul(img_tokens.astype(w_dtype), params["first_w"]) + params["first_b"]
-    combined = jnp.concatenate([text_tokens, img_emb], axis=1)
+    if text_tokens.shape[0] == 1 and batch > 1:
+        txt_b = jnp.broadcast_to(text_tokens, (batch, txt_len, text_tokens.shape[-1]))
+    else:
+        txt_b = text_tokens
+
+    if img_first:
+        combined = jnp.concatenate([img_emb, txt_b], axis=1)
+    else:
+        combined = jnp.concatenate([txt_b, img_emb], axis=1)
+
     if pad_len > 0:
         combined = jnp.pad(combined, ((0, 0), (0, pad_len), (0, 0)))
 
@@ -585,19 +802,23 @@ def dit_forward_precomputed(
         head_dim=config.head_dim,
         norm_eps=config.norm_eps,
         attn_impl=attn_impl,
-        splash_block_size=splash_block_size,
+        splash_block_q=bq,
+        splash_block_kv=bkv,
+        splash_block_kv_compute=bkvc,
+        static_valid_len=static_valid_len if img_first else None,
+        tp_size=tp_size,
     )
 
     def _scan_body(carry: jnp.ndarray, blk: dict[str, jnp.ndarray]):
         return block_fn(carry, blk, tvec, rope_cos, rope_sin, valid_mask), None
 
-    combined, _ = lax.scan(_scan_body, combined, params["blocks"])
+    combined, _ = lax.scan(_scan_body, combined, params["blocks"], unroll=max(1, int(scan_unroll)))
 
     # Slice image tokens BEFORE LastLayer so we skip redundant final norm+linear on text+pad!
-    img_out = combined[:, txt_len : txt_len + img_len, :]
+    img_out = combined[:, :img_len, :] if img_first else combined[:, txt_len : txt_len + img_len, :]
     mod_last = t_emb + params["last_mod_lin"][None, :, :]
     scale, shift = jnp.split(mod_last, 2, axis=1)
-    img_out = (1.0 + scale) * _rms_norm(img_out, params["last_norm"], config.norm_eps) + shift
+    img_out = _modulated_rms_norm(img_out, params["last_norm"], scale, shift, config.norm_eps, out_dtype=w_dtype)
     return _matmul(img_out, params["last_linear_w"]) + params["last_linear_b"]
 
 
@@ -610,7 +831,13 @@ def patchify_latents(latents: jnp.ndarray, patch: int = 2) -> jnp.ndarray:
     return x.reshape(b, hp * wp, c * patch * patch)
 
 
-def unpatchify_latents(tokens: jnp.ndarray, latent_h: int, latent_w: int, channels: int = 16, patch: int = 2) -> jnp.ndarray:
+def unpatchify_latents(
+    tokens: jnp.ndarray,
+    latent_h: int,
+    latent_w: int,
+    channels: int = 16,
+    patch: int = 2,
+) -> jnp.ndarray:
     """``[B, (H/p)*(W/p), C*p*p]`` -> ``[B, C, H, W]`` matching ``sampling.sample``."""
     b = tokens.shape[0]
     hp, wp = latent_h // patch, latent_w // patch
@@ -627,6 +854,15 @@ def make_denoise_fn(
     guidance_scale: float = 0.0,
     attn_impl: str = "splash",
     splash_block_size: int = 512,
+    splash_block_q: int | None = None,
+    splash_block_kv: int | None = None,
+    splash_block_kv_compute: int | None = None,
+    pos_static_valid_len: int | None = None,
+    neg_static_valid_len: int | None = None,
+    scan_unroll: int = 1,
+    gemm_pad_multiple: int = 256,
+    img_first: bool = True,
+    tp_size: int = 1,
     latent_dtype: Any = jnp.float32,
     donate_latents: bool = True,
 ):
@@ -636,6 +872,8 @@ def make_denoise_fn(
       zero unconditional conditioning work.
     - ``guidance_scale > 0.0`` (Raw / CFG mode): runs cond + uncond with
       ``v = cond + guidance_scale * (cond - uncond)`` (exact match to ``sampling.py``).
+    - Supports ``init_latents [B, C, H, W]`` with ``pos_context [1, L, 12, D]``
+      (runs TextFusion once and broadcasts across all ``B`` seeds!).
     """
     align = 8 * config.patch
     w_aligned = roundup(width, align)
@@ -667,6 +905,8 @@ def make_denoise_fn(
             latent_w=latent_w,
             attn_impl=attn_impl,
             splash_block_size=splash_block_size,
+            gemm_pad_multiple=gemm_pad_multiple,
+            img_first=img_first,
         )
         if do_cfg:
             assert neg_context is not None and neg_txtmask is not None
@@ -679,6 +919,8 @@ def make_denoise_fn(
                 latent_w=latent_w,
                 attn_impl=attn_impl,
                 splash_block_size=splash_block_size,
+                gemm_pad_multiple=gemm_pad_multiple,
+                img_first=img_first,
             )
         else:
             neg_txt = neg_cos = neg_sin = neg_mask = None
@@ -701,6 +943,13 @@ def make_denoise_fn(
                 pad_len=pos_pad,
                 attn_impl=attn_impl,
                 splash_block_size=splash_block_size,
+                splash_block_q=splash_block_q,
+                splash_block_kv=splash_block_kv,
+                splash_block_kv_compute=splash_block_kv_compute,
+                static_valid_len=pos_static_valid_len,
+                scan_unroll=scan_unroll,
+                img_first=img_first,
+                tp_size=tp_size,
             ).astype(latent_dtype)
 
             if do_cfg:
@@ -716,6 +965,13 @@ def make_denoise_fn(
                     pad_len=neg_pad,
                     attn_impl=attn_impl,
                     splash_block_size=splash_block_size,
+                    splash_block_q=splash_block_q,
+                    splash_block_kv=splash_block_kv,
+                    splash_block_kv_compute=splash_block_kv_compute,
+                    static_valid_len=neg_static_valid_len,
+                    scan_unroll=scan_unroll,
+                    img_first=img_first,
+                    tp_size=tp_size,
                 ).astype(latent_dtype)
                 v = cond + jnp.asarray(guidance_scale, dtype=latent_dtype) * (cond - uncond)
             else:

@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """Native JAX/XLA TPU inference runner & benchmark suite for Krea 2 (Turbo / Raw).
 
-Zero PyTorch runtime dependency. Incorporates MOSS-Image-TPU's model loading &
-stage-switching optimizations:
+Zero PyTorch runtime dependency. Performance & utilization stack:
 - RAM-backed ``tmpfs`` downloads by default on Linux TPU (auto-mounts up to
   64 GiB tmpfs on Colab, skipping duplicate 26 GB diffusers shards -> ~35.7 GiB).
 - Parallel pre-allocated NumPy/bfloat16 safetensors reads pipelined with async
-  field-by-field H2D ``jax.device_put`` (halving peak Host RAM & overlapping CPU
-  transpose/fuse with TPU DMA).
-- Explicit ``Array.delete()`` via ``release_tpu_pytree()`` for deterministic,
-  zero-GC-lag HBM reclamation during Stage 1 -> Stage 2 -> Stage 3 transitions.
-- Resident VAE (~125 MB BF16) auto-enabled on >= 20 GiB HBM (e.g. TPU v6e-1).
-- Multi-prompt batching across stages so Stage 1 / Stage 2 each load only ONCE.
+  field-by-field H2D ``jax.device_put`` with TPU-aligned contiguous layouts
+  (zero stride-2 SwiGLU / RoPE shuffles, pre-folded Q-scale & RMSNorm+1).
+- Text token compaction into static buckets + image-first ``[img | txt | pad]``
+  layout enabling compile-time static SplashAttention masks (zero VPU
+  ``SegmentIds`` overhead across 94-97% of image-to-image tiles).
+- Decoupled 256-aligned GEMM sequences + asymmetric SplashAttention tiling
+  ``(block_q, block_kv, block_kv_compute)`` + configurable ``lax.scan`` unroll.
+- Single-launch head-merged batched SplashAttention + prompt deduplication for
+  Midjourney-style multi-seed batch generation (``--num-images 4 --save-grid``).
+- Explicit ``Array.delete()`` via ``release_tpu_pytree()`` & resident VAE.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
-import os
+import math
 import statistics
 import sys
 import time
@@ -36,7 +39,7 @@ if str(REPO_ROOT) not in sys.path:
 def _tpu_peak_bf16_tflops(device_kind: str, num_chips: int = 1) -> float | None:
     kind = device_kind.lower()
     per_chip: float | None = None
-    if "v6e" in kind or "trillium" in kind:
+    if "v6" in kind or "trillium" in kind:
         per_chip = 918.0
     elif "v5e" in kind or "v5 lite" in kind:
         per_chip = 197.0
@@ -69,9 +72,52 @@ def _should_keep_vae_resident(mode: str, device: Any) -> bool:
         return True
     if mode == "off":
         return False
-    # Auto: gate resident VAE (~125 MB BF16) on >= 20 GiB HBM (matching MOSS-Image-TPU).
     limit = _memory_stats_gib(device).get("bytes_limit_gib")
     return bool(limit is not None and limit >= 20.0)
+
+
+def _resolve_splash_config(
+    args,
+    *,
+    width: int,
+    height: int,
+) -> tuple[int, int, int]:
+    """Resolve ``(block_q, block_kv, block_kv_compute)`` from CLI flags and resolution."""
+    is_hi_res = (width * height) >= (1536 * 1536)
+    base = args.splash_tile
+    if base is not None:
+        bq = args.splash_block_q if args.splash_block_q is not None else base
+        bkv = args.splash_block_kv if args.splash_block_kv is not None else base
+        bkvc = args.splash_block_kv_compute if args.splash_block_kv_compute is not None else min(bq, bkv)
+    else:
+        bq = args.splash_block_q if args.splash_block_q is not None else (1024 if is_hi_res else 512)
+        bkv = args.splash_block_kv if args.splash_block_kv is not None else 1024
+        bkvc = args.splash_block_kv_compute if args.splash_block_kv_compute is not None else 512
+    return int(bq), int(bkv), int(bkvc)
+
+
+def _parse_splash_configs(spec: str | None, fallback_tiles: str) -> list[tuple[int, int, int]]:
+    if spec:
+        out: list[tuple[int, int, int]] = []
+        for item in spec.split(","):
+            item = item.strip().lower()
+            if not item:
+                continue
+            parts = [int(p) for p in item.split("x")]
+            if len(parts) == 1:
+                out.append((parts[0], parts[0], parts[0]))
+            elif len(parts) == 2:
+                out.append((parts[0], parts[1], min(parts[0], parts[1])))
+            elif len(parts) == 3:
+                out.append((parts[0], parts[1], parts[2]))
+            else:
+                raise ValueError(f"Invalid splash config {item!r}; use BQ or BQxBKV or BQxBKVxBKVC.")
+        return out
+    return [(int(x.strip()), int(x.strip()), int(x.strip())) for x in fallback_tiles.split(",") if x.strip()]
+
+
+def _parse_int_list(spec: str) -> list[int]:
+    return [int(x.strip()) for x in spec.split(",") if x.strip()]
 
 
 def _configure_jax(args) -> tuple[Any, Any | None, list[Any]]:
@@ -158,23 +204,46 @@ def _make_init_latents(
     return np.concatenate(slices, axis=0)
 
 
-def _save_images(pixels_nhwc: np.ndarray, output_prefix: str | Path, *, start_idx: int = 0) -> list[str]:
+def _pixels_to_u8(pixels_nhwc: np.ndarray) -> np.ndarray:
+    arr = np.clip(pixels_nhwc, -1.0, 1.0) * 0.5 + 0.5
+    return np.clip(np.rint(arr * 255.0), 0, 255).astype(np.uint8)
+
+
+def _save_images(
+    pixels_nhwc: np.ndarray,
+    output_prefix: str | Path,
+    *,
+    start_idx: int = 0,
+    save_grid: bool = False,
+) -> list[str]:
     from PIL import Image
 
-    arr = np.clip(pixels_nhwc, -1.0, 1.0) * 0.5 + 0.5
-    u8 = np.clip(np.rint(arr * 255.0), 0, 255).astype(np.uint8)
+    u8 = _pixels_to_u8(pixels_nhwc)
     saved = []
     prefix = str(output_prefix)
+    stem = prefix[:-4] if prefix.endswith(".png") else prefix
     for i in range(u8.shape[0]):
         idx = start_idx + i
         if u8.shape[0] == 1 and start_idx == 0 and prefix.endswith(".png"):
             out_path = prefix
         else:
-            stem = prefix[:-4] if prefix.endswith(".png") else prefix
             out_path = f"{stem}_{idx}.png"
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(u8[i]).save(out_path)
         saved.append(out_path)
+
+    if save_grid and u8.shape[0] > 1:
+        n, h, w, c = u8.shape
+        cols = math.ceil(math.sqrt(n))
+        rows = math.ceil(n / cols)
+        canvas = np.zeros((rows * h, cols * w, c), dtype=np.uint8)
+        for i in range(n):
+            r, col = divmod(i, cols)
+            canvas[r * h : (r + 1) * h, col * w : (col + 1) * w] = u8[i]
+        grid_path = f"{stem}_grid.png" if start_idx == 0 else f"{stem}_grid_{start_idx}.png"
+        Path(grid_path).parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(canvas).save(grid_path)
+        saved.append(grid_path)
     return saved
 
 
@@ -264,6 +333,35 @@ def _encode_prompts_stage1(
     return results, metrics
 
 
+def _prepare_embeds_for_dit(
+    embeds: dict[str, np.ndarray],
+    *,
+    do_cfg: bool,
+    compact_text: bool,
+    text_buckets: tuple[int, ...],
+) -> tuple[dict[str, np.ndarray], int | None, int | None]:
+    """Optionally compact valid text tokens into static buckets and return exact valid counts."""
+    from tpu_jax.dit import compact_text_embeddings
+
+    out = dict(embeds)
+    pos_ctx, pos_mask = out["pos_context"], out["pos_txtmask"]
+    if compact_text:
+        pos_ctx, pos_mask, pos_common = compact_text_embeddings(pos_ctx, pos_mask, buckets=text_buckets)
+        out["pos_context"] = pos_ctx
+        out["pos_txtmask"] = pos_mask
+    else:
+        pos_common = None
+
+    neg_common = None
+    if do_cfg and "neg_context" in out and "neg_txtmask" in out:
+        neg_ctx, neg_mask = out["neg_context"], out["neg_txtmask"]
+        if compact_text:
+            neg_ctx, neg_mask, neg_common = compact_text_embeddings(neg_ctx, neg_mask, buckets=text_buckets)
+            out["neg_context"] = neg_ctx
+            out["neg_txtmask"] = neg_mask
+    return out, pos_common, neg_common
+
+
 def run_probe(args) -> dict[str, Any]:
     import jax
     import jax.numpy as jnp
@@ -320,7 +418,7 @@ def run_generate(args) -> dict[str, Any]:
 
     from tpu_jax.dit import make_denoise_fn
     from tpu_jax.model_cache import host_memory_stats_gib
-    from tpu_jax.scheduler import compute_timesteps, estimate_step_tflops
+    from tpu_jax.scheduler import compute_timesteps, estimate_step_tflops, roundup
     from tpu_jax.vae import make_vae_decode_fn
     from tpu_jax.weights import (
         load_dit_weights,
@@ -329,10 +427,10 @@ def run_generate(args) -> dict[str, Any]:
     )
 
     dev0, mesh, active_devs = _configure_jax(args)
+    tp_size = len(active_devs)
     device_kind = getattr(dev0, "device_kind", str(dev0))
-    peak_tflops = _tpu_peak_bf16_tflops(device_kind, len(active_devs))
+    peak_tflops = _tpu_peak_bf16_tflops(device_kind, tp_size)
 
-    # Build prompt list (supports --prompts-file for multi-prompt single-load execution!)
     if args.prompts_file:
         prompt_list = [
             line.strip()
@@ -363,14 +461,14 @@ def run_generate(args) -> dict[str, Any]:
             flush=True,
         )
 
-    # --- Stage 1: Encode ALL prompts once, then deterministically free Text Encoder HBM ---
+    # --- Stage 1: Encode each unique prompt ONCE (batch=1; DiT broadcasts over --num-images!) ---
     if args.prompt_embeds:
         data = np.load(args.prompt_embeds, allow_pickle=False)
-        embeds_list = [{k: data[k] for k in data.files}]
+        embeds_list = [{k: data[k][:1] for k in data.files}]
         stage1_metrics: dict[str, Any] = {"loaded_from_cache": str(args.prompt_embeds)}
     else:
-        prompt_groups = [[p] * args.num_images for p in prompt_list]
-        neg_groups = [[args.negative_prompt] * args.num_images for _ in prompt_list] if do_cfg else None
+        prompt_groups = [[p] for p in prompt_list]
+        neg_groups = [[args.negative_prompt] for _ in prompt_list] if do_cfg else None
         embeds_list, stage1_metrics = _encode_prompts_stage1(
             model_root,
             prompt_groups,
@@ -417,22 +515,64 @@ def run_generate(args) -> dict[str, Any]:
     if attn_impl == "auto":
         attn_impl = "splash" if (dev0.platform == "tpu" and mesh is None) else "xla"
 
-    denoise_fn = make_denoise_fn(
-        dit_cfg,
-        width=args.width,
-        height=args.height,
-        guidance_scale=args.cfg,
-        attn_impl=attn_impl,
-        splash_block_size=args.splash_tile,
-        latent_dtype=jnp.float32,
-        donate_latents=True,
-    )
+    bq, bkv, bkvc = _resolve_splash_config(args, width=args.width, height=args.height)
+    compact_text = args.compact_text != "off"
+    text_buckets = tuple(_parse_int_list(args.text_buckets))
+    align = 8 * dit_cfg.patch
+    img_len = (roundup(args.height, align) // align) * (roundup(args.width, align) // align)
 
     jnp_dtype = jnp.bfloat16 if args.dtype in ("bf16", "bfloat16") else jnp.float32
     all_run_times: list[float] = []
     final_latents_list: list[np.ndarray] = []
+    denoise_fn_cache: dict[tuple[Any, ...], Any] = {}
+    used_txt_len = 512
+    used_static_mask = False
 
-    for p_idx, embeds in enumerate(embeds_list):
+    for p_idx, raw_embeds in enumerate(embeds_list):
+        embeds, pos_common_txt, neg_common_txt = _prepare_embeds_for_dit(
+            raw_embeds,
+            do_cfg=do_cfg,
+            compact_text=compact_text,
+            text_buckets=text_buckets,
+        )
+        txt_len = int(embeds["pos_txtmask"].shape[1])
+        used_txt_len = txt_len
+
+        # Decide static NumpyMask vs dynamic SegmentIds.
+        use_static = False
+        if attn_impl == "splash" and compact_text and pos_common_txt is not None:
+            if args.splash_mask_mode == "static":
+                use_static = True
+            elif args.splash_mask_mode == "auto":
+                # Single prompt (incl. MJ batch-N): static mask eliminates VPU SegmentIds across all image tiles.
+                # Multi-prompt file: segment mode avoids recompiling per exact prompt token count.
+                use_static = (len(embeds_list) == 1) or (pos_common_txt == txt_len)
+        used_static_mask = use_static
+        pos_static_len = (img_len + pos_common_txt) if use_static and pos_common_txt is not None else None
+        neg_static_len = (
+            (img_len + neg_common_txt) if (use_static and do_cfg and neg_common_txt is not None) else None
+        )
+
+        cache_key = (txt_len, pos_static_len, neg_static_len)
+        if cache_key not in denoise_fn_cache:
+            denoise_fn_cache[cache_key] = make_denoise_fn(
+                dit_cfg,
+                width=args.width,
+                height=args.height,
+                guidance_scale=args.cfg,
+                attn_impl=attn_impl,
+                splash_block_q=bq,
+                splash_block_kv=bkv,
+                splash_block_kv_compute=bkvc,
+                pos_static_valid_len=pos_static_len,
+                neg_static_valid_len=neg_static_len,
+                scan_unroll=args.scan_unroll,
+                tp_size=tp_size,
+                latent_dtype=jnp.float32,
+                donate_latents=True,
+            )
+        denoise_fn = denoise_fn_cache[cache_key]
+
         init_lat_np = _make_init_latents(
             batch=args.num_images,
             width=args.width,
@@ -482,8 +622,8 @@ def run_generate(args) -> dict[str, Any]:
         dit_cfg,
         width=args.width,
         height=args.height,
-        txt_len=int(embeds_list[0]["pos_txtmask"].shape[1]),
-        pad_multiple=max(256, args.splash_tile) if attn_impl in ("splash", "flash") else 256,
+        txt_len=used_txt_len,
+        pad_multiple=256,
         batch_size=args.num_images,
         do_cfg=do_cfg,
     )
@@ -492,14 +632,21 @@ def run_generate(args) -> dict[str, Any]:
 
     stage2_metrics = {
         "attn_impl": attn_impl,
-        "splash_tile": args.splash_tile if attn_impl in ("splash", "flash") else None,
+        "splash_blocks": f"{bq}x{bkv}x{bkvc}" if attn_impl in ("splash", "flash") else None,
+        "splash_mask_mode": "static" if used_static_mask else "segment",
+        "compact_text": compact_text,
+        "effective_txt_len": used_txt_len,
+        "scan_unroll": args.scan_unroll,
+        "batch_size": args.num_images,
         "load_and_h2d_seconds": round(dit_load_sec, 3),
         "drop_tpu_seconds": round(dit_drop_sec, 4),
         "freed_leaves": dit_freed,
         "run_seconds": all_run_times,
         "cold_seconds": all_run_times[0],
         "warm_median_seconds": round(warm_median, 4),
+        "warm_sec_per_image": round(warm_median / max(1, args.num_images), 4),
         "warm_ms_per_step": round(warm_median * 1000.0 / args.steps, 2),
+        "warm_ms_per_step_per_image": round(warm_median * 1000.0 / (args.steps * max(1, args.num_images)), 2),
         "step_tflops_est": round(step_tflops, 2),
         "achieved_tflops": round(achieved_tflops, 2),
         "mfu_pct_bf16": mfu_pct,
@@ -514,7 +661,7 @@ def run_generate(args) -> dict[str, Any]:
     }
     print(f"[stage2:dit] {json.dumps(stage2_metrics)}", flush=True)
 
-    # --- Stage 3: VAE Decode (already resident on TPU if >= 20 GiB HBM) ---
+    # --- Stage 3: VAE Decode (micro-batched at 2K to avoid peak pixel buffer OOM) ---
     if vae_params is None:
         t_vae0 = time.perf_counter()
         vae_cfg, vae_params = load_vae_decoder_weights(model_root, dtype=args.vae_dtype, device=dev0)
@@ -522,21 +669,34 @@ def run_generate(args) -> dict[str, Any]:
         vae_load_sec = time.perf_counter() - t_vae0
 
     decode_fn = make_vae_decode_fn(vae_cfg, q_chunk_size=args.vae_attn_chunk)
+    vae_bs = args.vae_batch_size
+    if vae_bs <= 0:
+        vae_bs = 1 if (args.width * args.height >= 2_000_000) else max(1, args.num_images)
+
     saved_paths: list[str] = []
     decode_times: list[float] = []
     has_nan_pix = False
     img_counter = 0
     for lat_np in final_latents_list:
-        lat_j = jax.device_put(jnp.asarray(lat_np, dtype=jnp.float32), dev0)
-        t_dec0 = time.perf_counter()
-        pixels_j = decode_fn(vae_params, lat_j)
-        pixels_j.block_until_ready()
-        decode_times.append(round(time.perf_counter() - t_dec0, 4))
-        pixels_np = np.asarray(pixels_j, dtype=np.float32)
-        has_nan_pix = has_nan_pix or bool(np.isnan(pixels_np).any())
-        saved_paths.extend(_save_images(pixels_np, args.output, start_idx=img_counter))
-        img_counter += pixels_np.shape[0]
-        release_tpu_pytree((pixels_j, lat_j))
+        prompt_pixels: list[np.ndarray] = []
+        t_dec_total = 0.0
+        for s_idx in range(0, lat_np.shape[0], vae_bs):
+            sub_lat = lat_np[s_idx : s_idx + vae_bs]
+            lat_j = jax.device_put(jnp.asarray(sub_lat, dtype=jnp.float32), dev0)
+            t_dec0 = time.perf_counter()
+            pixels_j = decode_fn(vae_params, lat_j)
+            pixels_j.block_until_ready()
+            t_dec_total += time.perf_counter() - t_dec0
+            pix_np = np.asarray(pixels_j, dtype=np.float32)
+            has_nan_pix = has_nan_pix or bool(np.isnan(pix_np).any())
+            prompt_pixels.append(pix_np)
+            release_tpu_pytree((pixels_j, lat_j))
+        decode_times.append(round(t_dec_total, 4))
+        full_pix = np.concatenate(prompt_pixels, axis=0)
+        saved_paths.extend(
+            _save_images(full_pix, args.output, start_idx=img_counter, save_grid=args.save_grid)
+        )
+        img_counter += full_pix.shape[0]
 
     vae_mem = _memory_stats_gib(dev0)
     release_tpu_pytree(vae_params)
@@ -546,6 +706,7 @@ def run_generate(args) -> dict[str, Any]:
     stage3_metrics = {
         "vae_dtype": args.vae_dtype,
         "resident_vae": resident_vae,
+        "vae_batch_size": vae_bs,
         "load_seconds": round(vae_load_sec, 3),
         "decode_seconds": decode_times,
         "pixels_has_nan": has_nan_pix,
@@ -557,11 +718,12 @@ def run_generate(args) -> dict[str, Any]:
     report = {
         "jax_version": jax.__version__,
         "device_kind": device_kind,
-        "active_tp_devices": len(active_devs),
+        "active_tp_devices": tp_size,
         "peak_bf16_tflops": peak_tflops,
         "prompts": prompt_list,
         "width": args.width,
         "height": args.height,
+        "num_images": args.num_images,
         "steps": args.steps,
         "cfg": args.cfg,
         "mu": args.mu,
@@ -580,17 +742,18 @@ def run_generate(args) -> dict[str, Any]:
 
 
 def run_bench(args) -> dict[str, Any]:
-    """Matrix benchmark sweeping attention backends, tile sizes, and resolutions on DiT."""
+    """Matrix benchmark sweeping resolutions, batch sizes, attention configs, mask modes & scan unroll."""
     import jax
     import jax.numpy as jnp
 
-    from tpu_jax.dit import make_denoise_fn
-    from tpu_jax.scheduler import compute_timesteps, estimate_step_tflops
+    from tpu_jax.dit import compact_text_embeddings, make_denoise_fn
+    from tpu_jax.scheduler import compute_timesteps, estimate_step_tflops, roundup
     from tpu_jax.weights import load_dit_weights, release_tpu_pytree
 
     dev0, mesh, active_devs = _configure_jax(args)
+    tp_size = len(active_devs)
     device_kind = getattr(dev0, "device_kind", str(dev0))
-    peak_tflops = _tpu_peak_bf16_tflops(device_kind, len(active_devs))
+    peak_tflops = _tpu_peak_bf16_tflops(device_kind, tp_size)
 
     need_te = not (args.prompt_embeds or args.synthetic_embeds)
     comps: tuple[str, ...] = ("dit", "text_encoder", "tokenizer") if need_te else ("dit",)
@@ -598,14 +761,14 @@ def run_bench(args) -> dict[str, Any]:
 
     if args.prompt_embeds:
         data = np.load(args.prompt_embeds, allow_pickle=False)
-        pos_ctx_np = data["pos_context"]
-        pos_mask_np = data["pos_txtmask"].astype(bool)
+        pos_ctx_raw = data["pos_context"][:1]
+        pos_mask_raw = data["pos_txtmask"][:1].astype(bool)
     elif args.synthetic_embeds:
         rng = np.random.default_rng(0)
-        pos_ctx_np = rng.standard_normal((1, 512, 12, 2560)).astype(np.float32) * 0.1
-        pos_mask_np = np.zeros((1, 512), dtype=bool)
-        pos_mask_np[:, :48] = True
-        pos_mask_np[:, -5:] = True
+        pos_ctx_raw = rng.standard_normal((1, 512, 12, 2560)).astype(np.float32) * 0.1
+        pos_mask_raw = np.zeros((1, 512), dtype=bool)
+        pos_mask_raw[:, :48] = True
+        pos_mask_raw[:, -5:] = True
     else:
         embeds_list, _ = _encode_prompts_stage1(
             model_root,
@@ -616,8 +779,17 @@ def run_bench(args) -> dict[str, Any]:
             num_workers=args.load_workers,
             text_attn_impl="xla" if dev0.platform == "tpu" else "einsum",
         )
-        pos_ctx_np = embeds_list[0]["pos_context"]
-        pos_mask_np = embeds_list[0]["pos_txtmask"]
+        pos_ctx_raw = embeds_list[0]["pos_context"][:1]
+        pos_mask_raw = embeds_list[0]["pos_txtmask"][:1]
+
+    compact_text = args.compact_text != "off"
+    text_buckets = tuple(_parse_int_list(args.text_buckets))
+    if compact_text:
+        pos_ctx_np, pos_mask_np, common_valid_txt = compact_text_embeddings(
+            pos_ctx_raw, pos_mask_raw, buckets=text_buckets
+        )
+    else:
+        pos_ctx_np, pos_mask_np, common_valid_txt = pos_ctx_raw, pos_mask_raw, None
 
     t_load0 = time.perf_counter()
     dit_path = Path(args.dit_path) if args.dit_path else model_root
@@ -639,7 +811,10 @@ def run_bench(args) -> dict[str, Any]:
         pos_ctx, pos_mask = jax.device_put((pos_ctx, pos_mask), dev0)
 
     attn_impls = [x.strip() for x in args.attn_impls.split(",") if x.strip()]
-    splash_tiles = [int(x.strip()) for x in args.splash_tiles.split(",") if x.strip()]
+    splash_cfgs = _parse_splash_configs(args.splash_configs, args.splash_tiles)
+    mask_modes = [x.strip() for x in args.splash_mask_modes.split(",") if x.strip()]
+    batch_sizes = _parse_int_list(args.batch_sizes)
+    scan_unrolls = _parse_int_list(args.scan_unrolls)
     resolutions = []
     for item in args.resolutions.split(","):
         item = item.strip().lower()
@@ -648,101 +823,331 @@ def run_bench(args) -> dict[str, Any]:
         w_s, h_s = item.split("x")
         resolutions.append((int(w_s), int(h_s)))
 
+    align = 8 * dit_cfg.patch
+    txt_len = int(pos_mask_np.shape[1])
     cases = []
     for width, height in resolutions:
+        img_len = (roundup(height, align) // align) * (roundup(width, align) // align)
         ts_np = compute_timesteps(width=width, height=height, steps=args.steps, mu=args.mu)
         ts_j = jnp.asarray(ts_np, dtype=jnp.float32)
         if mesh is None:
             ts_j = jax.device_put(ts_j, dev0)
-        init_lat_np = _make_init_latents(
-            batch=1, width=width, height=height, channels=dit_cfg.channels, patch=dit_cfg.patch, seed=args.seed
-        )
 
-        for attn_impl in attn_impls:
-            tiles = splash_tiles if attn_impl in ("splash", "flash") else [args.splash_tile]
-            for tile in tiles:
-                case_name = (
-                    f"{width}x{height}_{attn_impl}"
-                    + (f"_tile{tile}" if attn_impl in ("splash", "flash") else "")
-                )
-                denoise_fn = make_denoise_fn(
-                    dit_cfg,
-                    width=width,
-                    height=height,
-                    guidance_scale=args.cfg,
-                    attn_impl=attn_impl,
-                    splash_block_size=tile,
-                    latent_dtype=jnp.float32,
-                    donate_latents=True,
-                )
-                run_times = []
-                err = None
-                last_lat = None
-                try:
-                    for r_idx in range(args.runs):
-                        lat_in = jnp.asarray(init_lat_np, dtype=jnp.float32)
-                        if mesh is None:
-                            lat_in = jax.device_put(lat_in, dev0)
-                        t0 = time.perf_counter()
-                        out = denoise_fn(dit_params, lat_in, pos_ctx, pos_mask, None, None, ts_j)
-                        out.block_until_ready()
-                        run_times.append(round(time.perf_counter() - t0, 4))
-                        if r_idx == 0:
-                            last_lat = np.asarray(out, dtype=np.float32)
-                        release_tpu_pytree(out)
-                except Exception as exc:
-                    err = f"{type(exc).__name__}: {exc}"
+        for batch_size in batch_sizes:
+            init_lat_np = _make_init_latents(
+                batch=batch_size,
+                width=width,
+                height=height,
+                channels=dit_cfg.channels,
+                patch=dit_cfg.patch,
+                seed=args.seed,
+            )
+            for attn_impl in attn_impls:
+                cfgs = splash_cfgs if attn_impl in ("splash", "flash") else [(512, 512, 512)]
+                m_modes = mask_modes if attn_impl == "splash" else ["segment"]
+                for bq, bkv, bkvc in cfgs:
+                    for m_mode in m_modes:
+                        for unroll in scan_unrolls:
+                            use_static = m_mode == "static" and compact_text and (common_valid_txt is not None)
+                            static_vlen = (img_len + common_valid_txt) if use_static else None
+                            case_name = (
+                                f"{width}x{height}_b{batch_size}_{attn_impl}"
+                                + (f"_{bq}x{bkv}x{bkvc}_{m_mode}" if attn_impl == "splash" else "")
+                                + (f"_u{unroll}" if unroll > 1 else "")
+                            )
+                            denoise_fn = make_denoise_fn(
+                                dit_cfg,
+                                width=width,
+                                height=height,
+                                guidance_scale=args.cfg,
+                                attn_impl=attn_impl,
+                                splash_block_q=bq,
+                                splash_block_kv=bkv,
+                                splash_block_kv_compute=bkvc,
+                                pos_static_valid_len=static_vlen,
+                                scan_unroll=unroll,
+                                tp_size=tp_size,
+                                latent_dtype=jnp.float32,
+                                donate_latents=True,
+                            )
+                            run_times = []
+                            err = None
+                            last_lat = None
+                            try:
+                                for r_idx in range(args.runs):
+                                    lat_in = jnp.asarray(init_lat_np, dtype=jnp.float32)
+                                    if mesh is None:
+                                        lat_in = jax.device_put(lat_in, dev0)
+                                    t0 = time.perf_counter()
+                                    out = denoise_fn(dit_params, lat_in, pos_ctx, pos_mask, None, None, ts_j)
+                                    out.block_until_ready()
+                                    run_times.append(round(time.perf_counter() - t0, 4))
+                                    if r_idx == 0:
+                                        last_lat = np.asarray(out, dtype=np.float32)
+                                    release_tpu_pytree(out)
+                            except Exception as exc:
+                                err = f"{type(exc).__name__}: {exc}"
 
-                if err is not None:
-                    entry = {
-                        "case": case_name,
-                        "width": width,
-                        "height": height,
-                        "attn_impl": attn_impl,
-                        "splash_tile": tile if attn_impl in ("splash", "flash") else None,
-                        "error": err,
-                        "memory_stats": _memory_stats_gib(dev0),
-                    }
-                else:
-                    warm_times = run_times[1:] if len(run_times) > 1 else run_times
-                    warm_med = float(statistics.median(warm_times))
-                    step_tf = estimate_step_tflops(
-                        dit_cfg,
-                        width=width,
-                        height=height,
-                        txt_len=int(pos_mask_np.shape[1]),
-                        pad_multiple=max(256, tile) if attn_impl in ("splash", "flash") else 256,
-                    )
-                    ach_tf = (step_tf * args.steps) / warm_med
-                    entry = {
-                        "case": case_name,
-                        "width": width,
-                        "height": height,
-                        "attn_impl": attn_impl,
-                        "splash_tile": tile if attn_impl in ("splash", "flash") else None,
-                        "steps": args.steps,
-                        "run_seconds": run_times,
-                        "cold_seconds": run_times[0],
-                        "warm_median_seconds": round(warm_med, 4),
-                        "warm_ms_per_step": round(warm_med * 1000.0 / args.steps, 2),
-                        "step_tflops_est": round(step_tf, 2),
-                        "achieved_tflops": round(ach_tf, 2),
-                        "mfu_pct_bf16": round(100.0 * ach_tf / peak_tflops, 2) if peak_tflops else None,
-                        "latents_has_nan": bool(np.isnan(last_lat).any()),
-                        "latents_std": round(float(np.std(last_lat)), 5),
-                        "memory_stats": _memory_stats_gib(dev0),
-                    }
-                cases.append(entry)
-                print(json.dumps(entry, indent=2), flush=True)
+                            if err is not None:
+                                entry = {
+                                    "case": case_name,
+                                    "width": width,
+                                    "height": height,
+                                    "batch_size": batch_size,
+                                    "attn_impl": attn_impl,
+                                    "splash_blocks": f"{bq}x{bkv}x{bkvc}" if attn_impl in ("splash", "flash") else None,
+                                    "splash_mask_mode": m_mode if attn_impl == "splash" else None,
+                                    "scan_unroll": unroll,
+                                    "error": err,
+                                    "memory_stats": _memory_stats_gib(dev0),
+                                }
+                            else:
+                                warm_times = run_times[1:] if len(run_times) > 1 else run_times
+                                warm_med = float(statistics.median(warm_times))
+                                step_tf = estimate_step_tflops(
+                                    dit_cfg,
+                                    width=width,
+                                    height=height,
+                                    txt_len=txt_len,
+                                    pad_multiple=256,
+                                    batch_size=batch_size,
+                                    do_cfg=args.cfg > 0.0,
+                                )
+                                ach_tf = (step_tf * args.steps) / warm_med
+                                entry = {
+                                    "case": case_name,
+                                    "width": width,
+                                    "height": height,
+                                    "batch_size": batch_size,
+                                    "attn_impl": attn_impl,
+                                    "splash_blocks": f"{bq}x{bkv}x{bkvc}" if attn_impl in ("splash", "flash") else None,
+                                    "splash_mask_mode": ("static" if use_static else "segment") if attn_impl == "splash" else None,
+                                    "compact_text": compact_text,
+                                    "effective_txt_len": txt_len,
+                                    "scan_unroll": unroll,
+                                    "steps": args.steps,
+                                    "run_seconds": run_times,
+                                    "cold_seconds": run_times[0],
+                                    "warm_median_seconds": round(warm_med, 4),
+                                    "warm_sec_per_image": round(warm_med / batch_size, 4),
+                                    "warm_ms_per_step": round(warm_med * 1000.0 / args.steps, 2),
+                                    "warm_ms_per_step_per_image": round(
+                                        warm_med * 1000.0 / (args.steps * batch_size), 2
+                                    ),
+                                    "step_tflops_est": round(step_tf, 2),
+                                    "achieved_tflops": round(ach_tf, 2),
+                                    "mfu_pct_bf16": round(100.0 * ach_tf / peak_tflops, 2) if peak_tflops else None,
+                                    "latents_has_nan": bool(np.isnan(last_lat).any()),
+                                    "latents_std": round(float(np.std(last_lat)), 5),
+                                    "memory_stats": _memory_stats_gib(dev0),
+                                }
+                            cases.append(entry)
+                            print(json.dumps(entry, indent=2), flush=True)
 
     summary = {
         "jax_version": jax.__version__,
         "device_kind": device_kind,
-        "active_tp_devices": len(active_devs),
+        "active_tp_devices": tp_size,
         "peak_bf16_tflops": peak_tflops,
         "model_cache": cache_info,
         "load_and_h2d_seconds": round(load_sec, 3),
         "cases": cases,
+    }
+    if args.save_report:
+        rp = Path(args.save_report)
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        rp.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return summary
+
+
+def run_microbench(args) -> dict[str, Any]:
+    """Synthetic single-block breakdown benchmark (no checkpoint download required!).
+
+    Measures isolated millisecond timings & TFLOP/s for every component inside one
+    Krea 2 SingleStreamBlock (4 MXU GEMMs, QKNorm+RoPE, SplashAttention across tile
+    & mask configs, and full 1-block forward) across ``--batch-sizes``.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from tpu_jax.config import Krea2DiTConfig
+    from tpu_jax.dit import (
+        _apply_rope,
+        _gqa_attention,
+        _matmul,
+        _rms_norm,
+        _single_stream_block_forward,
+        _swiglu_op,
+    )
+    from tpu_jax.scheduler import roundup
+    from tpu_jax.weights import release_tpu_pytree
+
+    dev0, _mesh, active_devs = _configure_jax(args)
+    device_kind = getattr(dev0, "device_kind", str(dev0))
+    peak_tflops = _tpu_peak_bf16_tflops(device_kind, len(active_devs))
+    cfg = Krea2DiTConfig()
+
+    d = cfg.features
+    hd = cfg.head_dim
+    hq = cfg.heads
+    hkv = cfg.kvheads
+    qkvg_out = 2 * hq * hd + 2 * hkv * hd
+    mlp_d = cfg.mlp_dim
+    dtype = jnp.bfloat16 if args.dtype in ("bf16", "bfloat16") else jnp.float32
+
+    align = 8 * cfg.patch
+    img_len = (roundup(args.height, align) // align) * (roundup(args.width, align) // align)
+    txt_len = 64 if args.compact_text != "off" else 512
+    seq_len = roundup(img_len + txt_len, 256)
+    valid_len = img_len + min(53, txt_len)
+
+    key = jax.random.PRNGKey(0)
+    k1, k2, k3, k4 = jax.random.split(key, 4)
+    block = {
+        "prenorm": jax.device_put(jnp.ones((d,), dtype=jnp.float32), dev0),
+        "postnorm": jax.device_put(jnp.ones((d,), dtype=jnp.float32), dev0),
+        "qnorm": jax.device_put(jnp.full((hd,), 1.0 / math.sqrt(hd), dtype=jnp.float32), dev0),
+        "knorm": jax.device_put(jnp.ones((hd,), dtype=jnp.float32), dev0),
+        "mod_lin": jax.device_put(jnp.zeros((6 * d,), dtype=dtype), dev0),
+        "qkvgate_w": jax.device_put(jax.random.normal(k1, (d, qkvg_out), dtype=dtype) * 0.02, dev0),
+        "wo_w": jax.device_put(jax.random.normal(k2, (d, d), dtype=dtype) * 0.02, dev0),
+        "mlp_gate_up_w": jax.device_put(jax.random.normal(k3, (d, 2 * mlp_d), dtype=dtype) * 0.02, dev0),
+        "mlp_down_w": jax.device_put(jax.random.normal(k4, (mlp_d, d), dtype=dtype) * 0.02, dev0),
+    }
+    jax.block_until_ready(block)
+
+    def _time_fn(fn, *fn_args, repeats: int = 10) -> float:
+        # 2 warmup + median of `repeats`
+        for _ in range(2):
+            out = fn(*fn_args)
+            jax.block_until_ready(out)
+        times = []
+        for _ in range(repeats):
+            t0 = time.perf_counter()
+            out = fn(*fn_args)
+            jax.block_until_ready(out)
+            times.append((time.perf_counter() - t0) * 1000.0)
+        return float(statistics.median(times))
+
+    splash_cfgs = _parse_splash_configs(args.splash_configs, args.splash_tiles)
+    mask_modes = [x.strip() for x in args.splash_mask_modes.split(",") if x.strip()]
+    batch_sizes = _parse_int_list(args.batch_sizes)
+
+    results: list[dict[str, Any]] = []
+    for bs in batch_sizes:
+        x = jax.device_put(jnp.ones((bs, seq_len, d), dtype=dtype) * 0.1, dev0)
+        tvec = jax.device_put(jnp.zeros((1, 1, 6 * d), dtype=dtype), dev0)
+        cos = jax.device_put(jnp.ones((1, seq_len, hd // 2), dtype=jnp.float32), dev0)
+        sin = jax.device_put(jnp.zeros((1, seq_len, hd // 2), dtype=jnp.float32), dev0)
+        vm_np = np.zeros((1, seq_len), dtype=np.bool_)
+        vm_np[:, :valid_len] = True
+        vm = jax.device_put(jnp.asarray(vm_np), dev0)
+        q_in = jax.device_put(jnp.ones((bs, seq_len, hq, hd), dtype=dtype) * 0.05, dev0)
+        k_in = jax.device_put(jnp.ones((bs, seq_len, hkv, hd), dtype=dtype) * 0.05, dev0)
+        v_in = jax.device_put(jnp.ones((bs, seq_len, hkv, hd), dtype=dtype) * 0.05, dev0)
+
+        def _rec(name: str, ms: float, flops: float) -> dict[str, Any]:
+            tf = (flops / 1e12) / (ms / 1000.0) if ms > 0 else 0.0
+            mfu = round(100.0 * tf / peak_tflops, 2) if peak_tflops else None
+            return {
+                "op": name,
+                "ms_1layer": round(ms, 3),
+                "ms_28layers_est": round(ms * cfg.layers, 2),
+                "tflops": round(tf, 2),
+                "mfu_pct": mfu,
+            }
+
+        ops = []
+        fn_qkvg = jax.jit(lambda a, w: _matmul(a, w))
+        ops.append(_rec("gemm_qkvgate", _time_fn(fn_qkvg, x, block["qkvgate_w"]), 2.0 * bs * seq_len * d * qkvg_out))
+
+        fn_wo = jax.jit(lambda a, w: _matmul(a, w))
+        ops.append(_rec("gemm_wo", _time_fn(fn_wo, x, block["wo_w"]), 2.0 * bs * seq_len * d * d))
+
+        fn_mgu = jax.jit(lambda a, w: _matmul(a, w))
+        ops.append(_rec("gemm_mlp_gate_up", _time_fn(fn_mgu, x, block["mlp_gate_up_w"]), 2.0 * bs * seq_len * d * (2 * mlp_d)))
+
+        fn_swiglu = jax.jit(lambda a, blk: _swiglu_op(a, blk))
+        ops.append(_rec("swiglu_full", _time_fn(fn_swiglu, x, block), 6.0 * bs * seq_len * d * mlp_d))
+
+        fn_qkr = jax.jit(
+            lambda qq, kk, qn, kn, c, s: (
+                _apply_rope(_rms_norm(qq, qn, cfg.norm_eps), c, s),
+                _apply_rope(_rms_norm(kk, kn, cfg.norm_eps), c, s),
+            )
+        )
+        ops.append(_rec("qknorm_plus_rope", _time_fn(fn_qkr, q_in, k_in, block["qnorm"], block["knorm"], cos, sin), 0.0))
+
+        attn_flops = 4.0 * bs * seq_len * seq_len * d
+        for bq, bkv, bkvc in splash_cfgs:
+            for m_mode in mask_modes:
+                svl = valid_len if m_mode == "static" else None
+                fn_sp = jax.jit(
+                    lambda qq, kk, vv, m, _bq=bq, _bkv=bkv, _bkvc=bkvc, _svl=svl: _gqa_attention(
+                        qq,
+                        kk,
+                        vv,
+                        m,
+                        attn_impl="splash",
+                        splash_block_q=_bq,
+                        splash_block_kv=_bkv,
+                        splash_block_kv_compute=_bkvc,
+                        static_valid_len=_svl,
+                    )
+                )
+                try:
+                    ms_sp = _time_fn(fn_sp, q_in, k_in, v_in, vm)
+                    ops.append(_rec(f"splash_{bq}x{bkv}x{bkvc}_{m_mode}", ms_sp, attn_flops))
+                except Exception as exc:
+                    ops.append({"op": f"splash_{bq}x{bkv}x{bkvc}_{m_mode}", "error": f"{type(exc).__name__}: {exc}"})
+
+        # Full single block with first splash config + static mask
+        bq0, bkv0, bkvc0 = splash_cfgs[0]
+        svl0 = valid_len if ("static" in mask_modes) else None
+        fn_blk = jax.jit(
+            lambda a, blk, tv, c, s, m: _single_stream_block_forward(
+                a,
+                blk,
+                tv,
+                c,
+                s,
+                m,
+                num_heads=hq,
+                num_kv_heads=hkv,
+                head_dim=hd,
+                norm_eps=cfg.norm_eps,
+                attn_impl="splash",
+                splash_block_q=bq0,
+                splash_block_kv=bkv0,
+                splash_block_kv_compute=bkvc0,
+                static_valid_len=svl0,
+            )
+        )
+        total_blk_flops = (
+            2.0 * bs * seq_len * d * (3 * d + 2 * hkv * hd)
+            + 6.0 * bs * seq_len * d * mlp_d
+            + attn_flops
+        )
+        ops.append(_rec(f"full_block_{bq0}x{bkv0}x{bkvc0}", _time_fn(fn_blk, x, block, tvec, cos, sin, vm), total_blk_flops))
+
+        entry = {
+            "width": args.width,
+            "height": args.height,
+            "seq_len": seq_len,
+            "valid_len": valid_len,
+            "batch_size": bs,
+            "ops": ops,
+        }
+        results.append(entry)
+        print(json.dumps(entry, indent=2), flush=True)
+        release_tpu_pytree((x, tvec, cos, sin, vm, q_in, k_in, v_in))
+
+    release_tpu_pytree(block)
+    summary = {
+        "jax_version": jax.__version__,
+        "device_kind": device_kind,
+        "peak_bf16_tflops": peak_tflops,
+        "results": results,
     }
     if args.save_report:
         rp = Path(args.save_report)
@@ -756,10 +1161,16 @@ def run_parity(args) -> dict[str, Any]:
     import jax
     import jax.numpy as jnp
 
-    from tpu_jax.dit import dit_forward_precomputed, patchify_latents, prepare_text_conditioning
+    from tpu_jax.dit import (
+        compact_text_embeddings,
+        dit_forward_precomputed,
+        patchify_latents,
+        prepare_text_conditioning,
+    )
     from tpu_jax.weights import load_dit_weights
 
-    dev0, mesh, _ = _configure_jax(args)
+    dev0, mesh, active_devs = _configure_jax(args)
+    tp_size = len(active_devs)
     model_root, cache_info = _resolve_model_root(args, components=("dit",))
     dit_path = Path(args.dit_path) if args.dit_path else model_root
 
@@ -777,13 +1188,21 @@ def run_parity(args) -> dict[str, Any]:
 
     rng = np.random.default_rng(args.seed)
     jnp_dtype = jnp.bfloat16 if args.dtype in ("bf16", "bfloat16") else jnp.float32
-    pos_ctx = jnp.asarray(rng.standard_normal((1, 512, 12, 2560)).astype(np.float32) * 0.1, dtype=jnp_dtype)
-    pos_mask_np = np.zeros((1, 512), dtype=bool)
-    pos_mask_np[:, :48] = True
-    pos_mask_np[:, -5:] = True
+    pos_ctx_raw = rng.standard_normal((1, 512, 12, 2560)).astype(np.float32) * 0.1
+    pos_mask_raw = np.zeros((1, 512), dtype=bool)
+    pos_mask_raw[:, :48] = True
+    pos_mask_raw[:, -5:] = True
+    if args.compact_text != "off":
+        pos_ctx_np, pos_mask_np, common_valid = compact_text_embeddings(
+            pos_ctx_raw, pos_mask_raw, buckets=tuple(_parse_int_list(args.text_buckets))
+        )
+    else:
+        pos_ctx_np, pos_mask_np, common_valid = pos_ctx_raw, pos_mask_raw, None
+
+    pos_ctx = jnp.asarray(pos_ctx_np, dtype=jnp_dtype)
     pos_mask = jnp.asarray(pos_mask_np, dtype=jnp.bool_)
     lat = jnp.asarray(
-        _make_init_latents(batch=1, width=args.width, height=args.height, seed=args.seed),
+        _make_init_latents(batch=args.num_images, width=args.width, height=args.height, seed=args.seed),
         dtype=jnp_dtype,
     )
     tok = patchify_latents(lat, patch=dit_cfg.patch)
@@ -791,15 +1210,18 @@ def run_parity(args) -> dict[str, Any]:
     if mesh is None:
         pos_ctx, pos_mask, tok, t_val = jax.device_put((pos_ctx, pos_mask, tok, t_val), dev0)
 
+    bq, bkv, bkvc = _resolve_splash_config(args, width=args.width, height=args.height)
     impls = [x.strip() for x in args.attn_impls.split(",") if x.strip()]
     lat_h, lat_w = args.height // 8, args.width // 8
+    img_len = (lat_h // dit_cfg.patch) * (lat_w // dit_cfg.patch)
+    static_vlen = (img_len + common_valid) if (common_valid is not None and args.splash_mask_mode != "segment") else None
     outputs = {}
     timings_ms = {}
     for impl in impls:
         @jax.jit
         def _single(p, x, t, c, m, _impl=impl):
             txt, cos, sin, jmask, pad_len = prepare_text_conditioning(
-                p, dit_cfg, c, m, latent_h=lat_h, latent_w=lat_w, attn_impl=_impl, splash_block_size=args.splash_tile
+                p, dit_cfg, c, m, latent_h=lat_h, latent_w=lat_w, attn_impl=_impl
             )
             return dit_forward_precomputed(
                 p,
@@ -812,7 +1234,12 @@ def run_parity(args) -> dict[str, Any]:
                 jmask,
                 pad_len=pad_len,
                 attn_impl=_impl,
-                splash_block_size=args.splash_tile,
+                splash_block_q=bq,
+                splash_block_kv=bkv,
+                splash_block_kv_compute=bkvc,
+                static_valid_len=static_vlen if _impl == "splash" else None,
+                scan_unroll=args.scan_unroll,
+                tp_size=tp_size,
             )
 
         out = _single(dit_params, tok, t_val, pos_ctx, pos_mask)
@@ -851,7 +1278,11 @@ def run_parity(args) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Native JAX/XLA TPU inference runner for Krea 2")
-    p.add_argument("--mode", choices=("probe", "generate", "bench", "parity"), default="probe")
+    p.add_argument(
+        "--mode",
+        choices=("probe", "generate", "bench", "microbench", "parity"),
+        default="probe",
+    )
     p.add_argument("--model", type=str, default=None, help="Local model snapshot directory")
     p.add_argument("--dit-path", type=str, default=None, help="Optional explicit turbo.safetensors / transformer/ path")
     p.add_argument(
@@ -876,18 +1307,41 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mu", type=float, default=1.15, help="Fixed 1.15 for Turbo; omit/None for dynamic")
     p.add_argument("--y1", type=float, default=0.5)
     p.add_argument("--y2", type=float, default=1.15)
-    p.add_argument("--num-images", type=int, default=1)
+    p.add_argument("--num-images", type=int, default=1, help="Batch size per prompt (e.g. 4 for MJ 4-up)")
+    p.add_argument("--save-grid", action="store_true", help="Also save a contact-sheet grid PNG when --num-images > 1")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--dtype", choices=("bf16", "bfloat16", "fp32", "float32"), default="bf16")
     p.add_argument("--quant", choices=("none", "int8"), default="none", help="Weight-only quantization for DiT")
     p.add_argument("--vae-dtype", choices=("bf16", "bfloat16", "fp32", "float32"), default="bf16")
+    p.add_argument("--vae-batch-size", type=int, default=0, help="VAE decode micro-batch (0=auto)")
     p.add_argument("--resident-vae", choices=("auto", "on", "off"), default="auto")
     p.add_argument("--vae-attn-chunk", type=int, default=1024)
     p.add_argument("--load-workers", type=int, default=None, help="Parallel CPU threads for safetensors streaming")
     p.add_argument("--attn-impl", choices=("auto", "splash", "flash", "xla", "einsum"), default="auto")
-    p.add_argument("--attn-impls", type=str, default="splash,flash,xla")
-    p.add_argument("--splash-tile", type=int, default=512)
-    p.add_argument("--splash-tiles", type=str, default="512,1024")
+    p.add_argument("--attn-impls", type=str, default="splash")
+    p.add_argument("--splash-tile", type=int, default=None, help="Symmetric Splash tile shorthand (overrides auto)")
+    p.add_argument("--splash-block-q", type=int, default=None, help="SplashAttention block_q (default: 512@1K, 1024@2K)")
+    p.add_argument("--splash-block-kv", type=int, default=None, help="SplashAttention block_kv (default: 1024)")
+    p.add_argument("--splash-block-kv-compute", type=int, default=None, help="SplashAttention block_kv_compute (default: 512)")
+    p.add_argument("--splash-tiles", type=str, default="512,1024", help="Fallback symmetric tiles for bench")
+    p.add_argument(
+        "--splash-configs",
+        type=str,
+        default="512x1024x512,1024x1024x512,1024x2048x512",
+        help="Comma-separated BQxBKVxBKVC configs for bench/microbench",
+    )
+    p.add_argument(
+        "--splash-mask-mode",
+        choices=("auto", "static", "segment"),
+        default="auto",
+        help="Static compile-time NumpyMask (zero VPU SegmentIds) vs dynamic SegmentIds",
+    )
+    p.add_argument("--splash-mask-modes", type=str, default="static,segment", help="Mask modes to sweep in bench")
+    p.add_argument("--compact-text", choices=("auto", "on", "off"), default="auto", help="Compact valid text tokens")
+    p.add_argument("--text-buckets", type=str, default="64,128,256,512", help="Static text bucket lengths")
+    p.add_argument("--scan-unroll", type=int, default=1, help="lax.scan unroll factor across the 28 DiT layers")
+    p.add_argument("--scan-unrolls", type=str, default="1", help="Unroll factors to sweep in bench (e.g. 1,2,4)")
+    p.add_argument("--batch-sizes", type=str, default="1,2,4", help="Batch sizes to sweep in bench/microbench")
     p.add_argument("--resolutions", type=str, default="1024x1024,2048x2048")
     p.add_argument("--tp", type=int, default=1, help="1D tensor parallel chips (1 for single v6e-1)")
     p.add_argument("--runs", type=int, default=2, help="1 cold + (runs-1) warm runs")
@@ -907,6 +1361,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.mode == "bench":
         run_bench(args)
+        return 0
+    if args.mode == "microbench":
+        run_microbench(args)
         return 0
     if args.mode == "parity":
         run_parity(args)

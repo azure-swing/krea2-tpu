@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import gc
 import json
+import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -181,7 +182,18 @@ class _LazySafetensorsReader:
         self._handles.clear()
 
 
-def _fuse_qkvgate_kv_grouped_into(
+def _rope_half_split_perm(head_dim: int) -> np.ndarray:
+    """Permutation ``[0, 2, ..., D-2, 1, 3, ..., D-1]`` for contiguous half-split RoPE."""
+    return np.concatenate([np.arange(0, head_dim, 2), np.arange(1, head_dim, 2)])
+
+
+def _permute_head_dim(w_t: np.ndarray, num_heads: int, head_dim: int, perm: np.ndarray) -> np.ndarray:
+    """Permute output head-dim channels of ``w_t [in_dim, num_heads * head_dim]``."""
+    in_dim = w_t.shape[0]
+    return w_t.reshape(in_dim, num_heads, head_dim)[:, :, perm].reshape(in_dim, num_heads * head_dim)
+
+
+def _fuse_qkvgate_into(
     out: np.ndarray,
     wq_t: np.ndarray,
     wk_t: np.ndarray,
@@ -191,20 +203,39 @@ def _fuse_qkvgate_kv_grouped_into(
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
+    tp_size: int = 1,
 ) -> None:
-    """Write KV-head-grouped ``[Q_group, K, V, Gate_group]`` directly into preallocated ``out``."""
+    """Write per-TP-shard contiguous ``[Q_s, K_s, V_s, Gate_s]`` directly into ``out``.
+
+    For ``tp_size == 1``, this produces a single contiguous ``[Q | K | V | Gate]`` layout
+    so TPU slicing avoids strided KV-group gathers. For ``tp_size > 1``, each TP shard
+    holds its own contiguous ``[Q_s | K_s | V_s | Gate_s]`` slice along the sharded axis.
+    """
     dim = wq_t.shape[0]
-    group = num_heads // num_kv_heads
-    q_g = group * head_dim
-    per_kv = 2 * q_g + 2 * head_dim
-    view = out.reshape(dim, num_kv_heads, per_kv)
-    view[:, :, :q_g] = wq_t.reshape(dim, num_kv_heads, q_g)
-    view[:, :, q_g : q_g + head_dim] = wk_t.reshape(dim, num_kv_heads, head_dim)
-    view[:, :, q_g + head_dim : q_g + 2 * head_dim] = wv_t.reshape(dim, num_kv_heads, head_dim)
-    view[:, :, q_g + 2 * head_dim :] = wgate_t.reshape(dim, num_kv_heads, q_g)
+    if tp_size <= 1:
+        q_dim = num_heads * head_dim
+        kv_dim = num_kv_heads * head_dim
+        out[:, :q_dim] = wq_t
+        out[:, q_dim : q_dim + kv_dim] = wk_t
+        out[:, q_dim + kv_dim : q_dim + 2 * kv_dim] = wv_t
+        out[:, q_dim + 2 * kv_dim :] = wgate_t
+        return
+
+    if num_kv_heads % tp_size != 0 or num_heads % tp_size != 0:
+        raise ValueError(
+            f"tp_size={tp_size} must divide num_heads={num_heads} and num_kv_heads={num_kv_heads}."
+        )
+    q_s = (num_heads // tp_size) * head_dim
+    kv_s = (num_kv_heads // tp_size) * head_dim
+    per_s = 2 * q_s + 2 * kv_s
+    view = out.reshape(dim, tp_size, per_s)
+    view[:, :, :q_s] = wq_t.reshape(dim, tp_size, q_s)
+    view[:, :, q_s : q_s + kv_s] = wk_t.reshape(dim, tp_size, kv_s)
+    view[:, :, q_s + kv_s : q_s + 2 * kv_s] = wv_t.reshape(dim, tp_size, kv_s)
+    view[:, :, q_s + 2 * kv_s :] = wgate_t.reshape(dim, tp_size, q_s)
 
 
-def _fuse_qkvgate_kv_grouped_np(
+def _fuse_qkvgate_np(
     wq_t: np.ndarray,
     wk_t: np.ndarray,
     wv_t: np.ndarray,
@@ -213,27 +244,60 @@ def _fuse_qkvgate_kv_grouped_np(
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
+    tp_size: int = 1,
 ) -> np.ndarray:
     dim = wq_t.shape[0]
-    group = num_heads // num_kv_heads
-    per_kv = 2 * group * head_dim + 2 * head_dim
-    out = np.empty((dim, num_kv_heads * per_kv), dtype=wq_t.dtype)
-    _fuse_qkvgate_kv_grouped_into(
-        out, wq_t, wk_t, wv_t, wgate_t, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim
+    total_out = 2 * num_heads * head_dim + 2 * num_kv_heads * head_dim
+    out = np.empty((dim, total_out), dtype=wq_t.dtype)
+    _fuse_qkvgate_into(
+        out,
+        wq_t,
+        wk_t,
+        wv_t,
+        wgate_t,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        tp_size=tp_size,
     )
     return out
 
 
-def _fuse_mlp_gate_up_paired_into(out: np.ndarray, wgate_t: np.ndarray, wup_t: np.ndarray) -> None:
-    """Write paired ``(gate_j, up_j)`` directly into preallocated ``out [dim, 2 * mlp_dim]``."""
-    out[:, 0::2] = wgate_t
-    out[:, 1::2] = wup_t
+def _fuse_mlp_gate_up_into(
+    out: np.ndarray,
+    wgate_t: np.ndarray,
+    wup_t: np.ndarray,
+    *,
+    tp_size: int = 1,
+) -> None:
+    """Write per-TP-shard contiguous ``[Gate_s | Up_s]`` directly into ``out [dim, 2 * mlp_dim]``.
+
+    Avoids stride-2 minor-dim interleaving (``0::2`` / ``1::2``), which causes costly
+    128-lane VPU shuffles on TPU.
+    """
+    dim, mlp_dim = wgate_t.shape
+    if tp_size <= 1:
+        out[:, :mlp_dim] = wgate_t
+        out[:, mlp_dim:] = wup_t
+        return
+
+    if mlp_dim % tp_size != 0:
+        raise ValueError(f"tp_size={tp_size} must divide mlp_dim={mlp_dim}.")
+    m_s = mlp_dim // tp_size
+    view = out.reshape(dim, tp_size, 2, m_s)
+    view[:, :, 0, :] = wgate_t.reshape(dim, tp_size, m_s)
+    view[:, :, 1, :] = wup_t.reshape(dim, tp_size, m_s)
 
 
-def _fuse_mlp_gate_up_paired_np(wgate_t: np.ndarray, wup_t: np.ndarray) -> np.ndarray:
+def _fuse_mlp_gate_up_np(
+    wgate_t: np.ndarray,
+    wup_t: np.ndarray,
+    *,
+    tp_size: int = 1,
+) -> np.ndarray:
     dim, mlp_dim = wgate_t.shape
     out = np.empty((dim, 2 * mlp_dim), dtype=wgate_t.dtype)
-    _fuse_mlp_gate_up_paired_into(out, wgate_t, wup_t)
+    _fuse_mlp_gate_up_into(out, wgate_t, wup_t, tp_size=tp_size)
     return out
 
 
@@ -260,6 +324,7 @@ def _build_dit_params(
     put_fn: Callable[[np.ndarray, Any | None], Any],
     num_workers: int = 1,
     tp_axis: str = "tp",
+    tp_size: int = 1,
     quant: str = "none",
 ) -> dict[str, Any]:
     from jax.sharding import PartitionSpec as P
@@ -270,6 +335,9 @@ def _build_dit_params(
     bf16_np = np.dtype(ml_dtypes.bfloat16)
     is_diffusers = "transformer_blocks.0.attn.to_q.weight" in all_keys
     f32 = np.dtype(np.float32)
+    rope_perm = _rope_half_split_perm(config.head_dim)
+    q_inv_sqrt = np.float32(1.0 / math.sqrt(config.head_dim))
+    txt_q_inv_sqrt = np.float32(1.0 / math.sqrt(config.text_head_dim))
 
     def _w_np(key: str, *, transpose: bool = False, dtype: np.dtype = np_dtype) -> np.ndarray:
         arr = _as_np(get_tensor(key), dtype)
@@ -288,7 +356,7 @@ def _build_dit_params(
             wv = _w_np(f"{prefix}.attn.to_v.weight", transpose=True)
             wg = _w_np(f"{prefix}.attn.to_gate.weight", transpose=True)
             wo = _w_np(f"{prefix}.attn.to_out.0.weight", transpose=True)
-            qn = _norm_np(f"{prefix}.attn.norm_q.weight")
+            qn = _norm_np(f"{prefix}.attn.norm_q.weight") * txt_q_inv_sqrt
             kn = _norm_np(f"{prefix}.attn.norm_k.weight")
             mg = _w_np(f"{prefix}.ff.gate.weight", transpose=True)
             mu = _w_np(f"{prefix}.ff.up.weight", transpose=True)
@@ -301,7 +369,7 @@ def _build_dit_params(
             wv = _w_np(f"{prefix}.attn.wv.weight", transpose=True)
             wg = _w_np(f"{prefix}.attn.gate.weight", transpose=True)
             wo = _w_np(f"{prefix}.attn.wo.weight", transpose=True)
-            qn = _norm_np(f"{prefix}.attn.qknorm.qnorm.scale")
+            qn = _norm_np(f"{prefix}.attn.qknorm.qnorm.scale") * txt_q_inv_sqrt
             kn = _norm_np(f"{prefix}.attn.qknorm.knorm.scale")
             mg = _w_np(f"{prefix}.mlp.gate.weight", transpose=True)
             mu = _w_np(f"{prefix}.mlp.up.weight", transpose=True)
@@ -309,7 +377,7 @@ def _build_dit_params(
             pn = _norm_np(f"{prefix}.prenorm.scale")
             pon = _norm_np(f"{prefix}.postnorm.scale")
 
-        qkvg = _fuse_qkvgate_kv_grouped_np(
+        qkvg = _fuse_qkvgate_np(
             wq,
             wk,
             wv,
@@ -317,8 +385,9 @@ def _build_dit_params(
             num_heads=config.txtheads,
             num_kv_heads=config.txtkvheads,
             head_dim=config.text_head_dim,
+            tp_size=1,
         )
-        mgu = _fuse_mlp_gate_up_paired_np(mg, mu)
+        mgu = _fuse_mlp_gate_up_np(mg, mu, tp_size=1)
         blk_out: dict[str, Any] = {
             "prenorm": put_fn(pn, None),
             "postnorm": put_fn(pon, None),
@@ -357,8 +426,7 @@ def _build_dit_params(
     dim = config.features
     hd = config.head_dim
     kv_heads = config.kvheads
-    group = config.heads // kv_heads
-    qkvg_out = kv_heads * (2 * group * hd + 2 * hd)
+    qkvg_out = 2 * config.heads * hd + 2 * kv_heads * hd
     mlp_dim = config.mlp_dim
 
     def _run_parallel(fn: Callable[[int], None]) -> None:
@@ -369,12 +437,24 @@ def _build_dit_params(
         with ThreadPoolExecutor(max_workers=min(num_workers, n_layers)) as ex:
             list(ex.map(fn, range(n_layers)))
 
-    def _stream_1d_norm(suffix_diff: str, suffix_nat: str, length: int):
+    def _stream_1d_norm(
+        suffix_diff: str,
+        suffix_nat: str,
+        length: int,
+        *,
+        perm: np.ndarray | None = None,
+        scale_factor: np.float32 | None = None,
+    ):
         buf = np.empty((n_layers, length), dtype=f32)
         suf = suffix_diff if is_diffusers else suffix_nat
 
         def _fill(i: int):
-            buf[i] = _norm_np(f"{blk_prefix}.{i}.{suf}")
+            v = _norm_np(f"{blk_prefix}.{i}.{suf}")
+            if perm is not None:
+                v = v[perm]
+            if scale_factor is not None:
+                v = v * scale_factor
+            buf[i] = v
 
         _run_parallel(_fill)
         res = put_fn(buf, None)
@@ -435,8 +515,19 @@ def _build_dit_params(
                 wk = _w_np(f"{p}.attn.wk.weight", transpose=True)
                 wv = _w_np(f"{p}.attn.wv.weight", transpose=True)
                 wg = _w_np(f"{p}.attn.gate.weight", transpose=True)
-            _fuse_qkvgate_kv_grouped_into(
-                dst, wq, wk, wv, wg, num_heads=config.heads, num_kv_heads=kv_heads, head_dim=hd
+            # Pre-permute Q/K head-dim channels to [even|odd] for contiguous half-split RoPE.
+            wq = _permute_head_dim(wq, config.heads, hd, rope_perm)
+            wk = _permute_head_dim(wk, kv_heads, hd, rope_perm)
+            _fuse_qkvgate_into(
+                dst,
+                wq,
+                wk,
+                wv,
+                wg,
+                num_heads=config.heads,
+                num_kv_heads=kv_heads,
+                head_dim=hd,
+                tp_size=tp_size,
             )
 
         if use_int8:
@@ -471,7 +562,7 @@ def _build_dit_params(
             else:
                 mg = _w_np(f"{p}.mlp.gate.weight", transpose=True)
                 mu = _w_np(f"{p}.mlp.up.weight", transpose=True)
-            _fuse_mlp_gate_up_paired_into(dst, mg, mu)
+            _fuse_mlp_gate_up_into(dst, mg, mu, tp_size=tp_size)
 
         if use_int8:
             buf_q = np.empty((n_layers, dim, 2 * mlp_dim), dtype=np.int8)
@@ -508,8 +599,19 @@ def _build_dit_params(
     blocks = {
         "prenorm": _stream_1d_norm("norm1.weight", "prenorm.scale", dim),
         "postnorm": _stream_1d_norm("norm2.weight", "postnorm.scale", dim),
-        "qnorm": _stream_1d_norm("attn.norm_q.weight", "attn.qknorm.qnorm.scale", hd),
-        "knorm": _stream_1d_norm("attn.norm_k.weight", "attn.qknorm.knorm.scale", hd),
+        "qnorm": _stream_1d_norm(
+            "attn.norm_q.weight",
+            "attn.qknorm.qnorm.scale",
+            hd,
+            perm=rope_perm,
+            scale_factor=q_inv_sqrt,
+        ),
+        "knorm": _stream_1d_norm(
+            "attn.norm_k.weight",
+            "attn.qknorm.knorm.scale",
+            hd,
+            perm=rope_perm,
+        ),
         "mod_lin": _stream_mod_lin(),
         "qkvgate_w": qkvgate_w,
         "wo_w": wo_w,
@@ -612,6 +714,7 @@ def build_dit_params_from_state_dict(
     np_dtype = _resolve_np_dtype(dtype)
     all_keys = set(state_dict.keys())
     put_fn = _make_put_fn(device=device, mesh=mesh)
+    tp_size = int(mesh.shape["tp"]) if mesh is not None else 1
 
     def _get(k: str):
         return state_dict.pop(k) if consume else state_dict[k]
@@ -623,6 +726,7 @@ def build_dit_params_from_state_dict(
         np_dtype=np_dtype,
         put_fn=put_fn,
         num_workers=1 if consume else num_workers,
+        tp_size=tp_size,
         quant=quant,
     )
 
@@ -693,6 +797,7 @@ def load_dit_weights(
     np_dtype = _resolve_np_dtype(dtype)
     workers = _default_num_workers(num_workers)
     put_fn = _make_put_fn(device=device, mesh=mesh)
+    tp_size = int(mesh.shape["tp"]) if mesh is not None else 1
 
     reader = _LazySafetensorsReader(files)
     try:
@@ -703,6 +808,7 @@ def load_dit_weights(
             np_dtype=np_dtype,
             put_fn=put_fn,
             num_workers=workers,
+            tp_size=tp_size,
             quant=quant,
         )
     finally:

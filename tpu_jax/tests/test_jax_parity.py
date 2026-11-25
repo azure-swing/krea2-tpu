@@ -14,17 +14,24 @@ Verifies every component of ``tpu_jax`` against upstream PyTorch modules:
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
+# Disable torch.compile before importing torch/mmdit so upstream @torch.compile(fullgraph=True)
+# runs eagerly on Windows CPU across PyTorch 2.6-2.11+ without MSVC/Triton.
+os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+
 import numpy as np
 import torch
 
-# Allow upstream mmdit.py (@torch.compile) to run eagerly on Windows CPU without MSVC/Triton.
+# Make upstream @torch.compile(fullgraph=True) in mmdit.py a no-op on CPU test runners
+# (PyTorch 2.11+ raises if fullgraph=True runs with dynamo disabled).
 torch._dynamo.config.disable = True
+torch.compile = lambda fn=None, *_a, **_kw: fn if fn is not None else (lambda f: f)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -317,6 +324,177 @@ class TestJaxDiTParity(unittest.TestCase):
                 atol=3e-4,
                 err_msg=f"Euler loop mismatch for guidance={guidance}",
             )
+
+    def test_text_compaction_and_mj_batch4_broadcast_and_unroll_match_pytorch(self):
+        import jax.numpy as jnp
+        import mmdit
+        import sampling
+        from tpu_jax.dit import compact_text_embeddings, make_denoise_fn
+
+        pt_model, jax_cfg, jax_native, _ = self._make_tiny_models()
+
+        torch.manual_seed(29)
+        b, c, lat_h, lat_w = 4, 4, 8, 8
+        width, height = lat_w * 8, lat_h * 8
+        txt_len = 12
+        lat_pt = torch.randn(b, c, lat_h, lat_w, dtype=torch.float32)
+        # Single prompt with interior padding gap + valid suffix (exact Krea 2 pattern)
+        pos_ctx_1 = torch.randn(1, txt_len, jax_cfg.txtlayers, jax_cfg.txtdim, dtype=torch.float32)
+        pos_mask_1 = torch.tensor([[1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1]], dtype=torch.bool)
+        pos_ctx_b = pos_ctx_1.expand(b, -1, -1, -1).contiguous()
+        pos_mask_b = pos_mask_1.expand(b, -1).contiguous()
+
+        ts_np = compute_timesteps(width=width, height=height, steps=3, mu=1.15)
+        x_pt, pos_pt, mask_pt = sampling.prepare(lat_pt, txt_len, jax_cfg.patch, pos_mask_b)
+        cur = x_pt.clone()
+        with torch.no_grad(), patch.object(mmdit, "sdpa_kernel", lambda *_a, **_kw: nullcontext()):
+            for tcurr, tprev in zip(ts_np[:-1], ts_np[1:]):
+                t_tensor = torch.full((b,), float(tcurr), dtype=torch.float32)
+                v = pt_model(cur, pos_ctx_b, t_tensor, pos_pt, mask_pt)
+                cur = cur + float(tprev - tcurr) * v
+        ref_lat = (
+            cur.reshape(b, lat_h // 2, lat_w // 2, c, 2, 2)
+            .permute(0, 3, 1, 4, 2, 5)
+            .reshape(b, c, lat_h, lat_w)
+            .numpy()
+        )
+
+        # Compact 12 -> 8 bucket (6 valid tokens) & broadcast batch=1 prompt across batch=4 seeds!
+        ctx_c, mask_c, common_valid = compact_text_embeddings(
+            pos_ctx_1.numpy(), pos_mask_1.numpy(), buckets=(8, 12)
+        )
+        self.assertEqual(ctx_c.shape[1], 8)
+        self.assertEqual(common_valid, 6)
+
+        for unroll in (1, 2):
+            denoise_fn = make_denoise_fn(
+                jax_cfg,
+                width=width,
+                height=height,
+                guidance_scale=0.0,
+                attn_impl="xla",
+                scan_unroll=unroll,
+                latent_dtype=jnp.float32,
+                donate_latents=False,
+            )
+            got_lat = np.asarray(
+                denoise_fn(
+                    jax_native,
+                    jnp.asarray(lat_pt.numpy()),
+                    jnp.asarray(ctx_c),
+                    jnp.asarray(mask_c),
+                    None,
+                    None,
+                    jnp.asarray(ts_np),
+                )
+            )
+            self.assertEqual(got_lat.shape, (b, c, lat_h, lat_w))
+            np.testing.assert_allclose(
+                got_lat,
+                ref_lat,
+                rtol=1e-4,
+                atol=3e-4,
+                err_msg=f"Compacted MJ batch=4 mismatch (unroll={unroll})",
+            )
+
+    def test_tp2_packed_layout_matches_pytorch(self):
+        import jax.numpy as jnp
+        import mmdit
+        import sampling
+        from tpu_jax.dit import dit_forward_precomputed, patchify_latents, prepare_text_conditioning
+        from tpu_jax.weights import _build_dit_params, _make_put_fn, _resolve_np_dtype
+
+        pt_model, jax_cfg, _, _ = self._make_tiny_models()
+        raw_sd = {k: v.detach().cpu().float().numpy() for k, v in pt_model.state_dict().items()}
+        tp2_params = _build_dit_params(
+            raw_sd.__getitem__,
+            set(raw_sd.keys()),
+            jax_cfg,
+            np_dtype=_resolve_np_dtype("float32"),
+            put_fn=_make_put_fn(device=None, mesh=None),
+            num_workers=1,
+            tp_size=2,
+        )
+
+        torch.manual_seed(17)
+        b, c, h, w = 2, 4, 8, 6
+        txt_len = 8
+        lat_pt = torch.randn(b, c, h, w, dtype=torch.float32)
+        ctx_pt = torch.randn(b, txt_len, jax_cfg.txtlayers, jax_cfg.txtdim, dtype=torch.float32)
+        txtmask_pt = torch.tensor([[1, 1, 1, 0, 0, 1, 1, 1], [1, 1, 0, 0, 0, 1, 1, 1]], dtype=torch.bool)
+        t_pt = torch.tensor([0.5, 0.8], dtype=torch.float32)
+
+        img_tok_pt, pos_pt, mask_pt = sampling.prepare(lat_pt, txt_len, jax_cfg.patch, txtmask_pt)
+        with torch.no_grad(), patch.object(mmdit, "sdpa_kernel", lambda *_a, **_kw: nullcontext()):
+            ref_out = pt_model(img_tok_pt, ctx_pt, t_pt, pos_pt, mask_pt).numpy()
+
+        tok_j = patchify_latents(jnp.asarray(lat_pt.numpy()), patch=jax_cfg.patch)
+        txt, cos, sin, jmask, pad_len = prepare_text_conditioning(
+            tp2_params, jax_cfg, jnp.asarray(ctx_pt.numpy()), jnp.asarray(txtmask_pt.numpy()),
+            latent_h=h, latent_w=w, attn_impl="xla",
+        )
+        got = np.asarray(
+            dit_forward_precomputed(
+                tp2_params, jax_cfg, tok_j, jnp.asarray(t_pt.numpy()),
+                txt, cos, sin, jmask, pad_len=pad_len, attn_impl="xla", tp_size=2,
+            )
+        )
+        np.testing.assert_allclose(got, ref_out, rtol=1e-4, atol=2e-4)
+
+
+class TestRunnerAndSplashHelpers(unittest.TestCase):
+    def test_v6_lite_peak_tflops_and_splash_block_resolution(self):
+        from types import SimpleNamespace
+        from tpu_jax.run_jax import _parse_splash_configs, _resolve_splash_config, _tpu_peak_bf16_tflops
+
+        self.assertEqual(_tpu_peak_bf16_tflops("TPU v6 lite", 1), 918.0)
+        self.assertEqual(_tpu_peak_bf16_tflops("TPU v6e", 4), 3672.0)
+        self.assertEqual(_tpu_peak_bf16_tflops("TPU v5 lite", 1), 197.0)
+
+        args_auto = SimpleNamespace(
+            splash_tile=None, splash_block_q=None, splash_block_kv=None, splash_block_kv_compute=None
+        )
+        self.assertEqual(_resolve_splash_config(args_auto, width=1024, height=1024), (512, 1024, 512))
+        self.assertEqual(_resolve_splash_config(args_auto, width=2048, height=2048), (1024, 1024, 512))
+        self.assertEqual(
+            _parse_splash_configs("512x1024x512,1024,1024x2048", "512"),
+            [(512, 1024, 512), (1024, 1024, 1024), (1024, 2048, 1024)],
+        )
+
+    def test_save_grid_creates_contact_sheet(self):
+        import tempfile
+        from PIL import Image
+        from tpu_jax.run_jax import _save_images
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pix = np.zeros((4, 32, 48, 3), dtype=np.float32)
+            saved = _save_images(pix, Path(tmp) / "mj_out", save_grid=True)
+            self.assertEqual(len(saved), 5)
+            with Image.open(saved[-1]) as grid_img:
+                self.assertEqual(grid_img.size, (96, 64))
+
+    @unittest.skipUnless(HAS_JAX, "JAX is not installed in this environment")
+    def test_splash_helpers_and_static_mask_builder(self):
+        from tpu_jax.dit import _build_static_splash_mask, _resolve_splash_block_sizes
+
+        self.assertEqual(_resolve_splash_block_sizes(4352, 512, 1024, 512), (512, 1024, 512, 4608, 5120))
+        self.assertEqual(_resolve_splash_block_sizes(16640, 1024, 2048, 512), (1024, 2048, 512, 17408, 18432))
+
+        class _FakeMaskMod:
+            @staticmethod
+            def FullMask(shape):
+                return ("full", shape)
+
+            @staticmethod
+            def NumpyMask(arr):
+                return ("numpy", arr)
+
+        kind, arr = _build_static_splash_mask(512, 1024, 420, _FakeMaskMod)
+        self.assertEqual(kind, "numpy")
+        self.assertEqual(arr.shape, (512, 1024))
+        self.assertTrue(bool(arr[:, :420].all()))
+        self.assertFalse(bool(arr[:, 420:].any()))
+        self.assertEqual(_build_static_splash_mask(512, 512, 512, _FakeMaskMod), ("full", (512, 512)))
 
 
 @unittest.skipUnless(HAS_JAX, "JAX is not installed in this environment")
